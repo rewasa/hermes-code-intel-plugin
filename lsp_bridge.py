@@ -289,6 +289,7 @@ class LSPBridge:
     _diagnostics_cache: Dict[str, List[dict]] = field(default_factory=dict, init=False, repr=False)
     _open_documents: set = field(default_factory=set, init=False, repr=False)  # Track open docs to avoid duplicate didOpen
     _reconcile_close_uris: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _doc_versions: Dict[str, int] = field(default_factory=dict, init=False, repr=False)  # textDocument version per URI for didChange
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -455,6 +456,7 @@ class LSPBridge:
             self._responses.clear()
             self._open_documents.clear()
             self._diagnostics_cache.clear()
+            self._doc_versions.clear()
             logger.info("LSP server stopped: %s", self.command)
 
     @property
@@ -1138,6 +1140,77 @@ class LSPBridge:
         """Return cached diagnostics that were pushed by textDocument/publishDiagnostics."""
         return self._diagnostics_cache.get(file_path)
 
+    def collect_diagnostics(
+        self,
+        file_path: str,
+        timeout: float = 3.0,
+        settle: float = 0.4,
+    ) -> Optional[List[dict]]:
+        """Force a fresh diagnostics cycle and wait for the server's push.
+
+        Most LSP servers (notably ``typescript-language-server`` and
+        ``pyright``) report diagnostics by *pushing* ``textDocument/publishDiagnostics``
+        rather than answering the pull request ``textDocument/diagnostic``.
+        This method drives that push reliably and waits for it.
+
+        Returns:
+            - ``[]``  -> server analysed the file and found nothing (clean file).
+            - ``[...]`` -> server reported errors/warnings.
+            - ``None`` -> no push arrived within ``timeout`` (caller may try the
+              pull request or the AST fallback).
+
+        The ``[]`` vs ``None`` distinction is deliberate: a clean file must report
+        an authoritative "0 problems" instead of dropping to the AST heuristic
+        (which can surface false positives the real compiler would not).
+
+        Servers emit syntactic diagnostics first and the slower *semantic*
+        diagnostics (where type errors live) shortly after. After the first
+        push we keep waiting up to ``settle`` for that follow-up so type errors
+        are not missed.
+        """
+        if not self.ensure_initialized():
+            return None
+        uri = f"file://{file_path}"
+        # Drop any stale push so we can detect the *fresh* one for this call.
+        with self._lock:
+            self._diagnostics_cache.pop(file_path, None)
+            already_open = uri in self._open_documents
+        if already_open:
+            # didOpen would be a no-op on an open document, so the server would
+            # not re-analyse. A didChange (full sync, bumped version) forces a
+            # fresh analysis and re-push — also picking up on-disk edits.
+            try:
+                content = Path(file_path).read_text("utf-8", errors="replace")
+            except OSError:
+                content = None
+            if content is not None:
+                with self._lock:
+                    version = self._doc_versions.get(uri, 1) + 1
+                    self._doc_versions[uri] = version
+                self._send_notification("textDocument/didChange", {
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [{"text": content}],
+                })
+        else:
+            self.open_document(file_path)
+            with self._lock:
+                self._doc_versions[uri] = 1
+        # Poll until the server pushes diagnostics for this path, then allow a
+        # short settle window for the semantic follow-up to overwrite the entry.
+        deadline = time.monotonic() + timeout
+        first_seen: Optional[float] = None
+        while time.monotonic() < deadline:
+            with self._lock:
+                present = file_path in self._diagnostics_cache
+            if present:
+                if first_seen is None:
+                    first_seen = time.monotonic()
+                elif time.monotonic() - first_seen >= settle:
+                    break
+            time.sleep(0.05)
+        with self._lock:
+            return self._diagnostics_cache.get(file_path)
+
     def get_server_info(self) -> dict:
         """Return basic health info about this bridge."""
         return {
@@ -1430,7 +1503,7 @@ def code_definition_tool(
         character = _auto_detect_identifier_column(str(target), lsp_line)
     lsp_char = (character or 0) - 1  # Convert to 0-based
 
-    logger.info("code_definition_tool: %s:%d:%d lang=%s", path, line, character, lang)
+    logger.info("code_definition_tool: %s:%d:%s lang=%s", path, line, character, lang)
 
     # Try LSP first
     manager = get_lsp_manager()
@@ -1583,22 +1656,37 @@ def code_diagnostics_tool(
     if lang:
         bridge = manager.get_bridge(lang, str(target))
         if bridge and bridge.ensure_initialized():
-            # Open the document first so the LSP server sends publishDiagnostics
-            bridge.open_document(str(target))
-            # Wait for publishDiagnostics notification to arrive in cache
-            if bridge.language_id in ("typescript", "typescriptreact", "javascript", "javascriptreact"):
-                time.sleep(1.0)  # TSServer needs time to analyze
-            else:
-                time.sleep(0.1)
+            is_ts = bridge.language_id in (
+                "typescript", "typescriptreact", "javascript", "javascriptreact"
+            )
+            # Drive a fresh publishDiagnostics cycle and wait for it. Returns
+            # [] for a clean file (authoritative), [...] with problems, or None
+            # if the server pushed nothing in time.
+            pushed = bridge.collect_diagnostics(
+                str(target),
+                timeout=4.0 if is_ts else 1.0,
+                settle=0.6 if is_ts else 0.15,
+            )
+            if pushed is not None:
+                # Authoritative LSP result — an empty list means "0 problems",
+                # which must NOT fall through to the AST heuristic.
+                summary = {
+                    "path": str(target),
+                    "method": "lsp",
+                    "lsp_server": bridge.command,
+                    "diagnostic_count": len(pushed),
+                    "errors": len([d for d in pushed if d.get("severity", 1) == 1]),
+                    "warnings": len([d for d in pushed if d.get("severity", 2) == 2]),
+                    "diagnostics": pushed[:20],  # Cap to avoid token bloat
+                }
+                logger.info(
+                    "code_diagnostics: LSP push returned %d diagnostics for %s",
+                    len(pushed), str(target),
+                )
+                return _json.dumps(summary, indent=2)
 
-            # Try cached LSP diagnostics (populated by textDocument/publishDiagnostics)
-            cached = bridge.get_cached_diagnostics(str(target))
-            if cached:
-                diagnostics = cached
-                logger.info("code_diagnostics: got %d cached diagnostics for %s", len(cached), str(target))
-
-    # If no cached diagnostics, try pull diagnostics (LSP 3.17+)
-    if not diagnostics and bridge and bridge.ensure_initialized():
+    # No push arrived — try pull diagnostics (LSP 3.17+, servers that support it)
+    if bridge and bridge.ensure_initialized():
         try:
             resp = bridge._send_request("textDocument/diagnostic", {
                 "textDocument": {"uri": f"file://{str(target)}"},
@@ -1608,22 +1696,20 @@ def code_diagnostics_tool(
             if resp and "items" in resp:
                 diagnostics = resp["items"]
                 logger.info("code_diagnostics: LSP pull returned %d items", len(diagnostics))
+                summary = {
+                    "path": str(target),
+                    "method": "lsp-pull",
+                    "lsp_server": bridge.command,
+                    "diagnostic_count": len(diagnostics),
+                    "errors": len([d for d in diagnostics if d.get("severity", 1) == 1]),
+                    "warnings": len([d for d in diagnostics if d.get("severity", 2) == 2]),
+                    "diagnostics": diagnostics[:20],
+                }
+                return _json.dumps(summary, indent=2)
         except Exception as exc:
             logger.debug("textDocument/diagnostic not supported by %s: %s", bridge.command, exc)
 
-    if diagnostics:
-        summary = {
-            "path": str(target),
-            "method": "lsp",
-            "lsp_server": bridge.command if bridge else None,
-            "diagnostic_count": len(diagnostics),
-            "errors": len([d for d in diagnostics if d.get("severity", 1) == 1]),
-            "warnings": len([d for d in diagnostics if d.get("severity", 2) == 2]),
-            "diagnostics": diagnostics[:20],  # Cap to avoid token bloat
-        }
-        return _json.dumps(summary, indent=2)
-
-    # Fallback: AST heuristic
+    # Fallback: AST heuristic (no LSP server, or server reported nothing in time)
     logger.debug("code_diagnostics: using AST fallback")
     return _ast_fallback_diagnostics(str(target), lang)
 
@@ -1894,7 +1980,7 @@ def _ast_fallback_definition(
         "path": file_path,
         "query": {"line": line, "character": character, "identifier": identifier},
         "method": "fallback_ast",
-        "warning": "LSP server unavailable, using AST-based search. Results may be incomplete.",
+        "warning": "LSP returned no results (or is unavailable), using AST-based search. Results may be incomplete.",
         "definition_count": len(defs),
         "definitions": defs,
     }, indent=2)
@@ -1997,7 +2083,7 @@ def _ast_fallback_references(
             "path": file_path,
             "query": {"line": line, "character": character, "identifier": identifier},
             "method": "fallback_text",
-            "warning": "LSP server unavailable, using text-based search. May include false positives.",
+            "warning": "LSP returned no results (or is unavailable), using text-based search. May include false positives.",
             "reference_count": len(refs),
             "files_affected": len(by_file),
             "references": refs,

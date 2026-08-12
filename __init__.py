@@ -296,9 +296,19 @@ def register(ctx: PluginContext) -> None:
     # correctly advertises code_intel as an available toolset.
     try:
         import tools.delegate_tool as dt
+        # Upstream delegate_tool.py (2026-07 refactor) dropped the module-level
+        # _EXCLUDED_TOOLSET_NAMES constant and moved exclusion into the runtime
+        # _strip_blocked_tools() helper. getattr() keeps this plugin working on
+        # both old and new Hermes builds instead of dying with AttributeError
+        # (which used to abort this whole block and silently disable the
+        # code_intel forcing/steering below).
+        _excluded = getattr(
+            dt, "_EXCLUDED_TOOLSET_NAMES",
+            frozenset({"debugging", "safe", "delegation", "moa", "rl", "code_execution"}),
+        )
         dt._SUBAGENT_TOOLSETS = sorted(
             name for name, defn in toolsets.TOOLSETS.items()
-            if name not in dt._EXCLUDED_TOOLSET_NAMES
+            if name not in _excluded
             and not name.startswith("hermes-")
             and not all(t in dt.DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
         )
