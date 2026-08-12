@@ -140,7 +140,10 @@ def load_symbol_cache() -> int:
         return 0
     try:
         with open(path) as f:
-            data = json.load(f)
+            content = f.read()
+            if not content.strip():
+                return 0
+            data = json.loads(content)
         if data.get("version") != _PERSIST_VERSION:
             logger.info("Symbol cache version mismatch, skipping load")
             return 0
@@ -856,6 +859,27 @@ def _format_symbols_output(
     })
 
 
+def _path_error(path: str) -> str:
+    """Return a JSON error object for a non-existent path, with recovery hints."""
+    import json as _json
+    result = {
+        "error": f"Path not found: {path}",
+        "cwd": str(Path.cwd()),
+        "hint": (
+            "The path does not exist. Do NOT retry with the same argument. "
+            "Either omit 'path' to use the current working directory, or call "
+            "terminal('pwd') / search_files to determine the real absolute path first. "
+            "Note: paths like /home/user/... are Linux defaults and are usually wrong on this machine."
+        ),
+        "cwd_entries": [],
+    }
+    try:
+        result["cwd_entries"] = [p.name for p in Path.cwd().iterdir()][:25]
+    except Exception:
+        pass
+    return _json.dumps(result)
+
+
 # ---------------------------------------------------------------------------
 # code_symbols tool implementation
 # ---------------------------------------------------------------------------
@@ -878,9 +902,7 @@ def code_symbols_tool(
     target = Path(path).expanduser().resolve()
 
     if not target.exists():
-        return json.dumps({
-            "error": f"Path not found: {path}",
-        })
+        return _path_error(path)
 
     if target.is_dir():
         # Skip language detection for directories — scan all supported files
@@ -1160,7 +1182,7 @@ def code_search_tool(
     target = Path(path).expanduser().resolve()
 
     if not target.exists():
-        return json.dumps({"error": f"Path not found: {path}"})
+        return _path_error(path)
 
     if target.is_file():
         return _code_search_single_file(target, query, preset, pattern, language, max_results)
@@ -1686,7 +1708,7 @@ def code_refactor_tool(
     target = Path(path).expanduser().resolve()
 
     if not target.exists():
-        return json.dumps({"error": f"Path not found: {path}"})
+        return _path_error(path)
 
     if target.is_dir():
         if language:
@@ -1778,7 +1800,7 @@ def code_capsule_tool(
     import json as _json
     target = Path(path).expanduser().resolve()
     if not target.exists():
-        return _json.dumps({"error": f"Path not found: {path}"})
+        return _path_error(path)
 
     lang = language or detect_language(str(target))
 
@@ -1930,20 +1952,26 @@ CODE_WORKSPACE_SUMMARY_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Root directory of the workspace/monorepo"},
+            "path": {"type": "string", "description": "Root directory of the workspace/monorepo. Optional — defaults to the current working directory. Omit it unless you know the exact absolute path."},
             "depth": {"type": "integer", "description": "How deep to scan for apps/packages (default: 2)"},
         },
-        "required": ["path"],
+        "required": [],
     },
 }
 
 
-def code_workspace_summary_tool(path: str, depth: int = 2) -> str:
+def code_workspace_summary_tool(path: str = "", depth: int = 2) -> str:
     """Return a compact monorepo/project overview: apps, packages, root markers, entry points."""
     import json as _json
-    target = Path(path).expanduser().resolve()
-    if not target.exists():
-        return _json.dumps({"error": f"Path not found: {path}"})
+    fallback_note = None
+    target = None
+    if path:
+        candidate = Path(path).expanduser().resolve()
+        if candidate.exists():
+            target = candidate
+    if target is None:
+        target = Path.cwd()
+        fallback_note = f"Requested path '{path}' not found — used current working directory instead." if path else None
 
     monorepo_markers = ["pnpm-workspace.yaml", "lerna.json", "nx.json", "turbo.json", "rush.json"]
     root_markers = []
@@ -2062,14 +2090,17 @@ def code_workspace_summary_tool(path: str, depth: int = 2) -> str:
         except Exception:
             pass
 
-    return _json.dumps({
+    result = {
         "root": str(target),
         "type": marker_type or "project",
         "apps": apps_list[:30],
         "packages": packages_list[:30],
         "root_markers": root_markers,
         "top_level_dependencies": dict(list(top_deps.items())[:20]),
-    }, indent=2)
+    }
+    if fallback_note:
+        result["note"] = fallback_note
+    return _json.dumps(result, indent=2)
 
 
 def _handle_code_workspace_summary(args, **kw):
@@ -2117,7 +2148,7 @@ def code_impact_tool(path: str, line: int = 0, language: Optional[str] = None) -
     import json as _json
     target = Path(path).expanduser().resolve()
     if not target.exists():
-        return _json.dumps({"error": f"Path not found: {path}"})
+        return _path_error(path)
 
     base_r = {
         "path": str(target),
@@ -2224,7 +2255,7 @@ def code_tests_for_symbol_tool(path: str, line: int, language: Optional[str] = N
     import json as _json
     target = Path(path).expanduser().resolve()
     if not target.exists():
-        return _json.dumps({"error": f"Path not found: {path}"})
+        return _path_error(path)
 
     try:
         from .lsp_bridge import code_references_tool
