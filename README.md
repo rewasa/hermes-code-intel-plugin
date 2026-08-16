@@ -167,6 +167,27 @@ The plugin automatically detects monorepo roots by scanning for `pnpm-workspace.
 
 The workspace folder list is cached per project root and cleared on shutdown.
 
+### Containerized Terminal Backends (Docker / Podman)
+
+code_intel tools always run on the **host**, so when your Hermes terminal backend is a `docker`/`podman` container, paths that only exist *inside* the container (e.g. files you `git clone` in the terminal) are invisible to code_intel on the host. This shows up as `Path not found: <path>` for a path the terminal can clearly see.
+
+Two complementary mechanisms are provided:
+
+1. **`CODE_INTEL_PATH_MAP` environment variable** — maps a container path prefix to the equivalent host path so code_intel can resolve the file on the host. Set it wherever the Hermes process starts (e.g. in `~/.hermes/config.yaml` or your shell profile):
+
+   ```bash
+   # Format: container_prefix1:host_prefix1,container_prefix2:host_prefix2
+   export CODE_INTEL_PATH_MAP="/app:/Users/me/project"
+   # Multiple mounts:
+   export CODE_INTEL_PATH_MAP="/app:/Users/me/project,/workspace:/tmp/ws"
+   ```
+
+   Longest matching prefix wins, so nested mounts resolve correctly. When a mapping matches, code_intel rewrites the path *before* resolving it, so `code_symbols`, `code_search`, `code_refactor`, `code_definition`, `code_references`, and workspace-root discovery all work on host-visible paths.
+
+2. **Actionable error hints** — if code_intel is asked for a path that looks like a container path (e.g. starts with `/app/`, `/workspace/`, `/home/`, `/root/`) and it doesn't exist on the host, the returned error now explains the mismatch and points at `CODE_INTEL_PATH_MAP` instead of just failing.
+
+**Workaround without a mapping:** pass the *host* absolute path (from `terminal('pwd')`) to code_intel instead of the container-relative path.
+
 ### TypeScript LSP Specifics
 
 The TypeScript LSP integration has several smart behaviors for monorepo setups:

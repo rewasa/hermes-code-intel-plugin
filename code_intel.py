@@ -862,6 +862,7 @@ def _format_symbols_output(
 def _path_error(path: str) -> str:
     """Return a JSON error object for a non-existent path, with recovery hints."""
     import json as _json
+    container_hint = _container_context_hint(path)
     result = {
         "error": f"Path not found: {path}",
         "cwd": str(Path.cwd()),
@@ -870,6 +871,7 @@ def _path_error(path: str) -> str:
             "Either omit 'path' to use the current working directory, or call "
             "terminal('pwd') / search_files to determine the real absolute path first. "
             "Note: paths like /home/user/... are Linux defaults and are usually wrong on this machine."
+            + (f" {container_hint}" if container_hint else "")
         ),
         "cwd_entries": [],
     }
@@ -878,6 +880,83 @@ def _path_error(path: str) -> str:
     except Exception:
         pass
     return _json.dumps(result)
+
+
+def _container_context_hint(path: str) -> str:
+    """Return an actionable hint when a Docker/Podman terminal backend is in use.
+
+    code_intel tools run on the HOST, so files cloned *inside* a container
+    (via a docker/podman terminal backend) are invisible to ``Path.resolve()``.
+    Detect the mismatch and tell the user to map the container path to a host
+    path, or to run code_intel in the same namespace as the terminal.
+    """
+    if not path:
+        return ""
+    hints = []
+    # Typical in-container working roots that do not exist on the host.
+    if path.startswith(("/app/", "/workspace/", "/home/", "/root/", "/usr/src/", "/srv/")):
+        hints.append(
+            "This looks like a *container* path. code_intel runs on the host, so it cannot see "
+            "files cloned inside a Docker/Podman terminal backend."
+        )
+    if os.environ.get("CODE_INTEL_PATH_MAP"):
+        hints.append("Set CODE_INTEL_PATH_MAP to map container→host prefixes (e.g. /app:/Users/me/proj).")
+    return " ".join(hints)
+
+
+# Container path-mapping — lets code_intel (running on the host) resolve file
+# paths that live inside a Docker/Podman terminal backend's container.
+#
+# Format:  CODE_INTEL_PATH_MAP="container_prefix1:host_prefix1,container_prefix2:host_prefix2"
+# e.g.     CODE_INTEL_PATH_MAP="/app:/Users/me/project"  (no trailing slash on prefixes)
+#
+# A single ``container:/host`` pair is also accepted (no comma needed).
+_PATH_MAP_CACHE: Optional[Dict[str, str]] = None
+
+def _load_path_map() -> Dict[str, str]:
+    """Parse CODE_INTEL_PATH_MAP once and cache it. Returns {container_prefix: host_prefix}."""
+    global _PATH_MAP_CACHE
+    if _PATH_MAP_CACHE is not None:
+        return _PATH_MAP_CACHE
+    mapping: Dict[str, str] = {}
+    raw = os.environ.get("CODE_INTEL_PATH_MAP", "").strip()
+    if raw:
+        # Split on commas, but tolerate a single "container:host" pair.
+        parts = [p for p in raw.split(",") if ":" in p] or ([raw] if ":" in raw else [])
+        for part in parts:
+            if ":" in part:
+                c, h = part.split(":", 1)
+                c = c.rstrip("/") or ""
+                h = h.rstrip("/") or ""
+                if c and h:
+                    mapping[c] = h
+    _PATH_MAP_CACHE = mapping
+    return mapping
+
+
+def _resolve_tool_path(path: str) -> Path:
+    """Resolve a tool ``path`` argument, translating container→host prefixes.
+
+    Falls back to plain ``expanduser().resolve()``. When a container-path
+    prefix matches a CODE_INTEL_PATH_MAP entry, the host prefix is substituted
+    so files cloned inside a Docker/Podman backend become visible to the
+    host-side code_intel tools.
+    """
+    p = Path(path).expanduser()
+    mapping = _load_path_map()
+    if mapping:
+        # Match the longest container prefix so nested mounts win.
+        text = str(p)
+        best = None
+        for prefix, host in mapping.items():
+            if text == prefix or text.startswith(prefix + "/"):
+                if best is None or len(prefix) > len(best[0]):
+                    best = (prefix, host)
+        if best:
+            prefix, host = best
+            remainder = text[len(prefix):]  # keep leading "/" so it joins cleanly
+            p = Path(host + remainder)
+    return p.resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +978,7 @@ def code_symbols_tool(
             "error": "Code intelligence dependencies are not installed. Please run: uv pip install 'hermes-agent[code-intel]'"
         })
     """Extract symbols from source files using tree-sitter AST parsing."""
-    target = Path(path).expanduser().resolve()
+    target = _resolve_tool_path(path)
 
     if not target.exists():
         return _path_error(path)
@@ -1179,7 +1258,7 @@ def code_search_tool(
 
     Accepts both files and directories (recursive scan of supported files).
     """
-    target = Path(path).expanduser().resolve()
+    target = _resolve_tool_path(path)
 
     if not target.exists():
         return _path_error(path)
@@ -1705,7 +1784,7 @@ def code_refactor_tool(
     Supports ast-grep meta variables: $NAME for single nodes, $$BODY for multiple nodes.
     Supports both files and directories (recursive scan across supported languages).
     """
-    target = Path(path).expanduser().resolve()
+    target = _resolve_tool_path(path)
 
     if not target.exists():
         return _path_error(path)
@@ -1798,7 +1877,7 @@ def code_capsule_tool(
     + read_file) into a single token-efficient JSON block.
     """
     import json as _json
-    target = Path(path).expanduser().resolve()
+    target = _resolve_tool_path(path)
     if not target.exists():
         return _path_error(path)
 
@@ -1966,7 +2045,7 @@ def code_workspace_summary_tool(path: str = "", depth: int = 2) -> str:
     fallback_note = None
     target = None
     if path:
-        candidate = Path(path).expanduser().resolve()
+        candidate = _resolve_tool_path(path)
         if candidate.exists():
             target = candidate
     if target is None:
@@ -2146,7 +2225,7 @@ CODE_IMPACT_SCHEMA = {
 def code_impact_tool(path: str, line: int = 0, language: Optional[str] = None) -> str:
     """Impact analysis for a symbol or file. Returns affected files, reference counts, test coverage."""
     import json as _json
-    target = Path(path).expanduser().resolve()
+    target = _resolve_tool_path(path)
     if not target.exists():
         return _path_error(path)
 
@@ -2253,7 +2332,7 @@ CODE_TESTS_FOR_SYMBOL_SCHEMA = {
 def code_tests_for_symbol_tool(path: str, line: int, language: Optional[str] = None) -> str:
     """Find and prioritize tests related to a symbol. Returns test files with relevance scores."""
     import json as _json
-    target = Path(path).expanduser().resolve()
+    target = _resolve_tool_path(path)
     if not target.exists():
         return _path_error(path)
 

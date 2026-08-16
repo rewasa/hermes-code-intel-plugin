@@ -93,6 +93,67 @@ _LANGUAGE_SERVERS: Dict[str, List[Dict[str, Any]]] = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Container path-mapping — lets code_intel (running on the host) resolve file
+# paths that live inside a Docker/Podman terminal backend's container.
+#
+# Format:  CODE_INTEL_PATH_MAP="container_prefix1:host_prefix1,container_prefix2:host_prefix2"
+# e.g.     CODE_INTEL_PATH_MAP="/app:/Users/me/project"  (no trailing slash on prefixes)
+#
+# A single ``container:/host`` pair is also accepted (no comma needed).
+_PATH_MAP_CACHE: Optional[Dict[str, str]] = None
+
+
+def _load_path_map() -> Dict[str, str]:
+    """Parse CODE_INTEL_PATH_MAP once and cache it. Returns {container_prefix: host_prefix}."""
+    global _PATH_MAP_CACHE
+    if _PATH_MAP_CACHE is not None:
+        return _PATH_MAP_CACHE
+    mapping: Dict[str, str] = {}
+    raw = os.environ.get("CODE_INTEL_PATH_MAP", "").strip()
+    if raw:
+        parts = [p for p in raw.split(",") if ":" in p] or ([raw] if ":" in raw else [])
+        for part in parts:
+            if ":" in part:
+                c, h = part.split(":", 1)
+                c = c.rstrip("/") or ""
+                h = h.rstrip("/") or ""
+                if c and h:
+                    mapping[c] = h
+    _PATH_MAP_CACHE = mapping
+    return mapping
+
+
+def _map_container_path(path: str) -> str:
+    """Translate a container path to its host path via CODE_INTEL_PATH_MAP.
+
+    Returns the (possibly) mapped path string; falls back to the input when no
+    mapping matches or none is configured. Longest prefix wins so nested mounts
+    are handled correctly.
+    """
+    if not path:
+        return path
+    mapping = _load_path_map()
+    if not mapping:
+        return path
+    best = None
+    for prefix, host in mapping.items():
+        if path == prefix or path.startswith(prefix + "/"):
+            if best is None or len(prefix) > len(best[0]):
+                best = (prefix, host)
+    if best:
+        prefix, host = best
+        return host + path[len(prefix):]
+    return path
+
+
+def _resolve_path(path: str) -> Path:
+    """Resolve a tool ``path`` argument, translating container→host prefixes.
+
+    Falls back to plain ``expanduser().resolve()``. Container paths mapped via
+    CODE_INTEL_PATH_MAP become visible to the host-side code_intel tools.
+    """
+    return Path(_map_container_path(Path(path).expanduser().as_posix())).resolve()
+
 
 def _find_workspace_root(file_path: str) -> str:
     """Best-effort workspace root discovery for *file_path*.
@@ -101,7 +162,7 @@ def _find_workspace_root(file_path: str) -> str:
     For monorepos, prefers the directory containing ``pnpm-workspace.yaml``,
     ``nx.json``, or ``lerna.json`` over a bare ``.git`` or ``package.json``.
     """
-    p = Path(file_path).resolve().parent
+    p = _resolve_path(file_path).parent
     # Monorepo markers take priority — they define the true workspace root
     mono_markers = ("pnpm-workspace.yaml", "nx.json", "lerna.json")
     # Generic project markers
@@ -139,7 +200,7 @@ def _find_workspace_root(file_path: str) -> str:
             break
         p = parent
     # Prefer monorepo root over generic root
-    return mono_root or generic_root or str(Path(file_path).resolve().parent)
+    return mono_root or generic_root or str(_resolve_path(file_path).parent)
 
 
 def _find_tsconfig_root(file_path: str) -> Optional[str]:
@@ -155,7 +216,7 @@ def _find_tsconfig_root(file_path: str) -> Optional[str]:
     2. Pick the NEAREST one (project-level) if it exists
     3. Only prefer the monorepo root if it has a tsconfig with project references
     """
-    p = Path(file_path).resolve().parent
+    p = _resolve_path(file_path).parent
 
     # Collect ALL tsconfig.json directories going up
     tsconfig_dirs = []
@@ -584,8 +645,16 @@ class LSPBridge:
                         continue
 
                     self._dispatch(msg)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Never let a reader crash vanish silently — a broken
+            # Content-Length header, corrupt stream, or unexpected JSON-RPC
+            # parse failure is exactly what makes LSP calls hang and fall back
+            # to the AST heuristic with no diagnosable cause.
+            if isinstance(exc, (OSError, EOFError, json.JSONDecodeError)):
+                logger.debug("LSP reader ended (%s: %s) for %s", type(exc).__name__, exc, self.command)
+            else:
+                logger.warning("LSP reader crashed (%s: %s) for %s root=%s",
+                               type(exc).__name__, exc, self.command, self.root_uri)
         finally:
             self._alive = False
             # Wake up any pending waiters
@@ -611,15 +680,23 @@ class LSPBridge:
                 if self._is_expected_reconcile_close_message(text):
                     logger.debug("LSP server reconcile-close noise suppressed: %s", text)
                     return
-                level_map = {1: logging.INFO, 2: logging.WARNING, 3: logging.INFO, 4: logging.DEBUG}
-                logger.log(level_map.get(level, logging.DEBUG), "LSP server: %s", text)
+                # Downgrade the pauschal ERROR->INFO only for known-noise
+                # patterns (tsserver routinely sends type=1 info chatter). Any
+                # unknown type-1 message stays at WARNING so real server errors
+                # are not hidden.
+                if level == 1 and not self._is_noise_log_message(text):
+                    logger.warning("LSP server error: %s", text)
+                else:
+                    level_map = {1: logging.INFO, 2: logging.WARNING, 3: logging.INFO, 4: logging.DEBUG}
+                    logger.log(level_map.get(level, logging.DEBUG), "LSP server: %s", text)
             elif method == "textDocument/publishDiagnostics":
                 # Log diagnostics for the opened file (errors/warnings) and cache them
                 params = msg.get("params", {})
                 uri = params.get("uri", "")
                 diagnostics = params.get("diagnostics", [])
                 path = LSPBridge._uri_to_path(uri)
-                self._diagnostics_cache[path] = diagnostics
+                with self._lock:
+                    self._diagnostics_cache[path] = diagnostics
                 errors = [d for d in diagnostics if d.get("severity") == 1]  # Error=1, Warning=2, Info=3, Hint=4
                 warnings = [d for d in diagnostics if d.get("severity") == 2]
                 if errors:
@@ -659,6 +736,31 @@ class LSPBridge:
         if "not open" not in lower_text and "not opened" not in lower_text:
             return False
         return True
+
+    _NOISE_LOG_PATTERNS = (
+        "listening on",
+        "read tcp",
+        "semantic diagnostics",
+        "synchronizing",
+        "file watching",
+        "telemetry",
+        "no space left",
+        "client has disconnected",
+    )
+
+    def _is_noise_log_message(self, text: str) -> bool:
+        """Return True for known informational type=1 (Error) chatter that
+        should be downgraded to INFO rather than logged as a real error.
+
+        tsserver and friends routinely emit type=1 messages that are benign
+        (connection teardown, semantic sync notes, watch messages). Anything
+        not matching the known-noise list is a genuine server error and must
+        stay at WARNING.
+        """
+        if not text:
+            return False
+        lower_text = text.lower()
+        return any(p in lower_text for p in self._NOISE_LOG_PATTERNS)
 
     # -- LSP operations ------------------------------------------------------
 
@@ -1138,7 +1240,8 @@ class LSPBridge:
 
     def get_cached_diagnostics(self, file_path: str) -> Optional[List[dict]]:
         """Return cached diagnostics that were pushed by textDocument/publishDiagnostics."""
-        return self._diagnostics_cache.get(file_path)
+        with self._lock:
+            return self._diagnostics_cache.get(file_path)
 
     def collect_diagnostics(
         self,
@@ -1491,7 +1594,7 @@ def code_definition_tool(
     """
     import json as _json
 
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -1563,7 +1666,7 @@ def code_references_tool(
     """
     import json as _json
 
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -1644,7 +1747,7 @@ def code_diagnostics_tool(
     Falls back to lightweight AST heuristic if no LSP server is available.
     """
     import json as _json
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -1723,7 +1826,7 @@ def code_callers_tool(
 ) -> str:
     """Find call sites of a symbol (where it is invoked)."""
     import json as _json
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -1803,7 +1906,7 @@ def code_callees_tool(
     Uses AST extraction (call expressions inside the function body) for Python/TS/JS.
     """
     import json as _json
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -2497,7 +2600,7 @@ def code_workspace_symbols_tool(
     """
     import json as _json
 
-    anchor = Path(path).expanduser().resolve() if path else Path.cwd().resolve()
+    anchor = _resolve_path(path) if path else Path.cwd().resolve()
     if not anchor.exists():
         return _json.dumps({"error": f"Path not found: {anchor}"})
 
@@ -2664,7 +2767,7 @@ def code_rename_tool(
     """
     import json as _json
 
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -2826,7 +2929,7 @@ def code_hover_tool(
     """
     import json as _json
 
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -2920,7 +3023,7 @@ def code_type_definition_tool(
     """
     import json as _json
 
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -3031,7 +3134,7 @@ def code_signatures_tool(
     """
     import json as _json
 
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 
@@ -3219,7 +3322,7 @@ def code_action_tool(
     """
     import json as _json
 
-    target = Path(path).expanduser().resolve()
+    target = _resolve_path(path)
     if not target.exists():
         return _json.dumps({"error": f"Path not found: {path}"})
 

@@ -408,6 +408,43 @@ class TestErrorHandling:
         assert result.get("symbol_count", 0) == 0
 
 
+class TestContainerPathMapping:
+    """CODE_INTEL_PATH_MAP lets host-side code_intel resolve container paths
+    (Docker/Podman terminal backends). See GH issue #1."""
+
+    def test_code_intel_path_map(self, monkeypatch):
+        import code_intel.code_intel as ci
+        monkeypatch.setenv("CODE_INTEL_PATH_MAP", "/app:/Users/me/project,/workspace:/tmp/ws")
+        ci._PATH_MAP_CACHE = None
+        assert str(ci._resolve_tool_path("/app/foo")).endswith("/Users/me/project/foo")
+        assert str(ci._resolve_tool_path("/workspace/x")).endswith("/tmp/ws/x")
+        # Longest prefix wins
+        assert str(ci._resolve_tool_path("/app/sub")).endswith("/Users/me/project/sub")
+        ci._PATH_MAP_CACHE = None
+
+    def test_no_map_passthrough(self, monkeypatch):
+        import code_intel.code_intel as ci
+        monkeypatch.delenv("CODE_INTEL_PATH_MAP", raising=False)
+        ci._PATH_MAP_CACHE = None
+        # /app is a non-existent host path but mapping is off — passthrough only.
+        assert str(ci._resolve_tool_path("/app/foo")).startswith("/app/foo")
+        ci._PATH_MAP_CACHE = None
+
+    def test_lsp_path_map(self, monkeypatch):
+        import code_intel.lsp_bridge as lb
+        monkeypatch.setenv("CODE_INTEL_PATH_MAP", "/app:/Users/me/project")
+        lb._PATH_MAP_CACHE = None
+        assert str(lb._resolve_path("/app/x")).endswith("/Users/me/project/x")
+        assert str(lb._resolve_path("/other")).startswith("/other")
+        lb._PATH_MAP_CACHE = None
+
+    def test_path_error_container_hint(self, monkeypatch):
+        import code_intel.code_intel as ci
+        monkeypatch.delenv("CODE_INTEL_PATH_MAP", raising=False)
+        result = json.loads(ci._path_error("/app/missing.py"))
+        assert "container" in result["hint"].lower()
+
+
 # ---------------------------------------------------------------------------
 # Registry integration
 # ---------------------------------------------------------------------------
