@@ -1,9 +1,12 @@
-from typing import Any, Optional
+from __future__ import annotations
+
+from typing import Any, Optional, TYPE_CHECKING
 from pathlib import Path
-from hermes_cli.plugins import PluginContext
-import toolsets
 import os
 import json
+
+if TYPE_CHECKING:  # Hermes runtime only — not present in CI/standalone
+    from hermes_cli.plugins import PluginContext
 
 # Slash command handler
 def _handle_code_intel_slash(raw_args: str) -> Optional[str]:
@@ -82,6 +85,8 @@ def _on_session_end(**kwargs: Any) -> None:
 
 
 def register(ctx: PluginContext) -> None:
+    import toolsets  # Hermes runtime only — imported lazily so CI/standalone can import this module
+
     # 0. Register plugin-provided skill (opt-in via skill_view("code_intel:native-code-intelligence"))
     _plugin_dir = Path(__file__).parent
     _skill_md = _plugin_dir / "skills" / "native-code-intelligence.md"
