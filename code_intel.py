@@ -1132,7 +1132,17 @@ def _check_code_intel_reqs() -> bool:
 # Register tools
 # ---------------------------------------------------------------------------
 
-from tools.registry import registry
+# The Hermes ``tools.registry`` is only present when running inside Hermes.
+# In standalone contexts (CI, tests, a fresh clone) it is absent, so fall back
+# to a no-op registry that keeps the module importable without Hermes.
+try:
+    from tools.registry import registry
+except ImportError:  # pragma: no cover - exercised in CI/standalone only
+    class _NoopRegistry:
+        def register(self, **kwargs):
+            return None
+
+    registry = _NoopRegistry()
 
 
 def _handle_code_symbols(args, **kw):

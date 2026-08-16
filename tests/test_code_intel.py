@@ -451,6 +451,7 @@ class TestContainerPathMapping:
 
 
 def test_registry_has_code_symbols():
+    pytest.importorskip("tools.registry", reason="Hermes runtime not present (CI)", exc_type=ImportError)
     from tools.registry import registry
     import code_intel.code_intel  # noqa: F401 — ensure registered
     assert "code_symbols" in registry.get_all_tool_names()
@@ -458,6 +459,7 @@ def test_registry_has_code_symbols():
 
 
 def test_handler_callable():
+    pytest.importorskip("tools.registry", reason="Hermes runtime not present (CI)", exc_type=ImportError)
     from tools.registry import registry
     import code_intel.code_intel  # noqa: F401
     entry = registry.get_entry("code_symbols")
@@ -846,6 +848,7 @@ class TestLSPBridgeDocumentLifecycle:
 
 
 def test_registry_has_code_search():
+    pytest.importorskip("tools.registry", reason="Hermes runtime not present (CI)", exc_type=ImportError)
     from tools.registry import registry
     import code_intel.code_intel  # noqa: F401 — ensure registered
     assert "code_search" in registry.get_all_tool_names()
@@ -853,6 +856,7 @@ def test_registry_has_code_search():
 
 
 def test_registry_has_code_refactor():
+    pytest.importorskip("tools.registry", reason="Hermes runtime not present (CI)", exc_type=ImportError)
     from tools.registry import registry
     import code_intel.code_intel  # noqa: F401 — ensure registered
     assert "code_refactor" in registry.get_all_tool_names()
