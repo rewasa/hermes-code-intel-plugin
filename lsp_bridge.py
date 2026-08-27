@@ -2424,7 +2424,8 @@ CODE_DEFINITION_SCHEMA = {
         "Tells you WHERE a function, class, variable, or type is defined. "
         "Requires a file path and the line where the symbol reference appears. "
         "Uses pyright/pylsp for Python, typescript-language-server for TS/JS (cross-file resolution). "
-        "Falls back to AST-based search if LSP is unavailable."
+        "Falls back to AST-based search if LSP is unavailable. "
+        "Use this INSTEAD of grep/search_files when you need the exact declaration site of a known symbol."
     ),
     "parameters": {
         "type": "object",
@@ -2445,7 +2446,8 @@ CODE_REFERENCES_SCHEMA = {
         "Shows every file and line where a function, class, variable, or type is used. "
         "Requires a file path and the line where the symbol is defined or referenced. "
         "Uses pyright/pylsp for Python, typescript-language-server for TS/JS (cross-file resolution). "
-        "Falls back to text-based search if LSP is unavailable."
+        "Falls back to text-based search if LSP is unavailable. "
+        "Use this INSTEAD of grep/search_files when you need every call site of a symbol, not just text matches."
     ),
     "parameters": {
         "type": "object",
@@ -2465,7 +2467,8 @@ CODE_DIAGNOSTICS_SCHEMA = {
     "name": "code_diagnostics",
     "description": (
         "Fetch LSP diagnostics (errors, warnings, info) for a source file. "
-        "Falls back to a lightweight AST lint heuristic if no LSP server is active."
+        "Falls back to a lightweight AST lint heuristic if no LSP server is active. "
+        "Use this INSTEAD of running a linter/build manually when you just need current errors for one file."
     ),
     "parameters": {
         "type": "object",
@@ -2481,7 +2484,8 @@ CODE_CALLERS_SCHEMA = {
     "name": "code_callers",
     "description": (
         "Find call sites of a symbol — files and lines WHERE it is invoked. "
-        "Requires a file path and line where the callee is defined. Uses LSP references with heuristics."
+        "Requires a file path and line where the callee is defined. Uses LSP references with heuristics. "
+        "Use this INSTEAD of grep for a function name when you need actual call sites, not string matches."
     ),
     "parameters": {
         "type": "object",
@@ -2501,7 +2505,8 @@ CODE_CALLEES_SCHEMA = {
     "description": (
         "Find symbols CALLED BY a specific function or method. "
         "Requires a file path and the line where the function is defined. "
-        "Uses AST-based extraction for Python/TS/JS; LSP fallback if available."
+        "Uses AST-based extraction for Python/TS/JS; LSP fallback if available. "
+        "Use this INSTEAD of manually reading a function body when you just need what it calls."
     ),
     "parameters": {
         "type": "object",
@@ -2980,7 +2985,8 @@ CODE_HOVER_SCHEMA = {
         "Get type signature, parameter info, and docstring for a symbol via LSP hover. "
         "Use this BEFORE calling/editing a function to confirm its exact signature without "
         "reading the full definition. Faster + cheaper than code_capsule when you only need "
-        "the type info. Requires LSP server (pyright/tsserver/gopls/etc)."
+        "the type info. Requires LSP server (pyright/tsserver/gopls/etc). "
+        "Use this INSTEAD of read_file when you only need a signature, not the whole function body."
     ),
     "parameters": {
         "type": "object",
@@ -3071,7 +3077,8 @@ CODE_TYPE_DEFINITION_SCHEMA = {
         "not its value declaration. Use this when you need to understand the SHAPE "
         "of a value before refactoring — e.g. for `const u = getUser()`, this lands on "
         "the `User` interface, while code_definition lands on `getUser()`'s body. "
-        "Requires LSP (most useful for TypeScript/Go/Rust)."
+        "Requires LSP (most useful for TypeScript/Go/Rust). "
+        "Use this INSTEAD of code_definition when you need the type's shape, not the value's declaration."
     ),
     "parameters": {
         "type": "object",
@@ -3215,7 +3222,8 @@ CODE_SIGNATURES_SCHEMA = {
         "Use BEFORE writing or editing a call to an unfamiliar function — returns the "
         "parameter list, types, active parameter index, and inline docs without reading "
         "source files. Reduces wrong-args bugs in generated code. Cursor MUST be inside "
-        "the call's parentheses."
+        "the call's parentheses. "
+        "Use this INSTEAD of read_file/code_definition when you only need the parameter list at a call site."
     ),
     "parameters": {
         "type": "object",
@@ -3414,7 +3422,8 @@ CODE_ACTION_SCHEMA = {
         "Request LSP code actions: quick-fixes, organize imports, source.fixAll, refactor.extract/inline. "
         "Two modes — list (default) or apply_index=N. Use this AFTER code_diagnostics to auto-fix errors "
         "(e.g. add missing imports, remove unused vars). Use kind='source.organizeImports' for cleanup. "
-        "MUCH safer than manual edits — preserves semantics via the language server."
+        "MUCH safer than manual edits — preserves semantics via the language server. "
+        "Use this INSTEAD of hand-editing imports/quick-fixes when the LSP can do it safely."
     ),
     "parameters": {
         "type": "object",

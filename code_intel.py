@@ -2036,7 +2036,8 @@ CODE_WORKSPACE_SUMMARY_SCHEMA = {
     "name": "code_workspace_summary",
     "description": (
         "Returns a compact overview of a monorepo: apps, packages, root markers, "
-        "top-level dependencies, and entry points. Use to understand project structure."
+        "top-level dependencies, and entry points. "
+        "Use this INSTEAD of manually listing/reading directories to understand project structure."
     ),
     "parameters": {
         "type": "object",
@@ -2218,7 +2219,7 @@ CODE_IMPACT_SCHEMA = {
     "description": (
         "Impact analysis before refactors or API changes. For a symbol or file, shows "
         "affected files, reference counts, test coverage, and confidence level. "
-        "Use BEFORE making changes to understand blast radius."
+        "Use this INSTEAD of manually grepping for usages BEFORE making changes to understand blast radius."
     ),
     "parameters": {
         "type": "object",
@@ -2325,7 +2326,8 @@ CODE_TESTS_FOR_SYMBOL_SCHEMA = {
     "name": "code_tests_for_symbol",
     "description": (
         "Find tests that cover a specific symbol. Returns prioritized test files with "
-        "relevance scores. Use before making changes to ensure safe refactoring."
+        "relevance scores. Use this INSTEAD of grepping test dirs by name BEFORE changing "
+        "a symbol to ensure safe refactoring."
     ),
     "parameters": {
         "type": "object",
@@ -2489,6 +2491,7 @@ CODE_QUERY_SCHEMA = {
         "Smart query router for code intelligence. Describe what you want to find "
         "(e.g. 'find_usage', 'definition', 'rename', 'impact', 'tests') and it auto-selects "
         "the best tool. Returns routing decision + recommended args. "
+        "Use this INSTEAD of guessing which code_intel tool to call when unsure — it picks for you. "
         "If you already know which tool to use, call it directly."
     ),
     "parameters": {

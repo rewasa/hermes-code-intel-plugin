@@ -83,6 +83,12 @@ def _on_session_end(**kwargs: Any) -> None:
     saved = persist_symbol_cache()
     clear_symbol_cache()
 
+    # B1: proactively drop this session's nudge-rate-limit state instead of
+    # relying solely on LRU eviction under sustained load.
+    from .code_intel_nudges import forget_session
+    session_key = kwargs.get("session_id") or kwargs.get("task_id")
+    forget_session(session_key)
+
 
 def register(ctx: PluginContext) -> None:
     import toolsets  # Hermes runtime only — imported lazily so CI/standalone can import this module
@@ -177,6 +183,53 @@ def register(ctx: PluginContext) -> None:
             return None
 
     ctx.register_hook("pre_llm_call", _pre_llm_call_inject_context)
+
+    # M1: mechanical steering via transform_tool_result — fires on EVERY
+    # handle_function_call regardless of spawn path (Paseo, delegate_task,
+    # plain CLI), unlike the old _CODE_INTEL_STEERING text block below which
+    # only reaches tools.delegate_tool subagents. See code_intel_nudges.py.
+    def _transform_tool_result_nudge(**kwargs: Any) -> Optional[str]:
+        try:
+            from .code_intel_nudges import build_nudge
+            tool_name = kwargs.get("tool_name", "")
+            if tool_name not in ("read_file", "search_files", "terminal"):
+                return None
+            args = kwargs.get("args") or {}
+            result = kwargs.get("result")
+            session_id = kwargs.get("session_id")
+            task_id = kwargs.get("task_id")
+            hint = build_nudge(tool_name, args, result, session_id, task_id)
+            if not hint or not isinstance(result, str):
+                return None
+            return result + hint
+        except Exception as e:
+            import logging
+            logging.getLogger("code_intel").debug(f"nudge hook error: {e}")
+            return None
+
+    ctx.register_hook("transform_tool_result", _transform_tool_result_nudge)
+
+    # B9: on an old Hermes core, an unknown hook name is silently accepted
+    # (stored + warned) but never invoked — a stealth total outage for the
+    # nudge feature. Detect that here so it fails loudly instead of quietly:
+    # if the running core doesn't advertise transform_tool_result support,
+    # log one unmistakable warning pointing at the real cause.
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+        if "transform_tool_result" not in VALID_HOOKS:
+            import logging
+            logging.getLogger("code_intel").warning(
+                "code_intel: this Hermes core's VALID_HOOKS does not include "
+                "'transform_tool_result' — the code_intel nudge feature is "
+                "registered but will NEVER fire. Upgrade Hermes or the nudge "
+                "hook is silently dead."
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger("code_intel").warning(
+            f"code_intel: could not verify transform_tool_result hook support "
+            f"on this Hermes core ({e}) — nudge feature may be silently dead."
+        )
 
     # 2. Inject the code_intel toolset definition
     if "code_intel" not in toolsets.TOOLSETS:

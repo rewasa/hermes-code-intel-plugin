@@ -5,6 +5,7 @@ __pycache__/
 patch_*.py
 .backups/
 .cache/
+*.bak.pre-steering
 # Self-referential symlink guard — the repo root may be symlinked into a
 # profile plugins dir; never let that link be committed or scanned recursively.
 code-intel-plugin
