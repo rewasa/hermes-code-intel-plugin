@@ -158,16 +158,42 @@ def _is_source_path(path: str) -> bool:
 
 
 def _is_source_dir(path: str) -> bool:
+    # Cap the flat iterdir scan so grep/find on huge non-source dirs
+    # (node_modules, dist, .git) can't do thousands of stat() calls per
+    # terminal call. 300 entries: a real source dir has at least one
+    # source file among its first handful; node_modules-style trees exceed
+    # the cap without one and correctly fail closed (no nudge).
+    _MAX_SCAN_ENTRIES = 300
     try:
         p = Path(path)
         if not p.is_dir():
             return False
-        return any(
-            c.is_file() and c.suffix.lower() in _SOURCE_EXTENSIONS
-            for c in p.iterdir()
-        )
+        for i, c in enumerate(p.iterdir()):
+            if i >= _MAX_SCAN_ENTRIES:
+                return False
+            if c.is_file() and c.suffix.lower() in _SOURCE_EXTENSIONS:
+                return True
+        return False
     except OSError:
         return False
+
+
+def _iter_candidate_paths(command: str):
+    """Yield path-like tokens from a shell command (source dir/file refs).
+
+    Used by the terminal nudge to catch `grep -r X apps/unified-api/app`
+    style invocations where the target is a real source path but the
+    command string contains no literal source extension (the old suffix
+    check missed these — the dominant volume of on-source greps).
+    """
+    for tok in re.split(r"\s+", command):
+        t = tok.strip("'\"").rstrip(";,&|")
+        if not t:
+            continue
+        if t.startswith(("-",)) or t in ("~",):
+            continue
+        if "/" in t or t in (".", "..") or t.startswith("~"):
+            yield t
 
 
 def _take_nudge_slot(session_key: str, trigger: str) -> bool:
@@ -267,7 +293,26 @@ def build_nudge(
         command_lower = command.lower()
         if not _GREP_RE.search(command_lower):
             return None
-        if not any(ext in command_lower for ext in _SOURCE_EXTENSIONS):
+        # `find -name/-iname/-path ...` locates paths by NAME, not a source
+        # content scan — never nudge those (would teach the wrong lesson).
+        # Any of these flags means a names/location lookup, never a grep-style
+        # code search code_intel could have done. (No extension exception:
+        # `find -name "*.ts"` is still a name lookup, not a content scan.)
+        if re.search(r"\s-(?:name|iname|path)\s", command_lower):
+            return None
+        # Old check: only a literal source extension in the command string
+        # (grep -rn X --include=*.py). Missed the dominant case `grep -rln X
+        # apps/unified-api/app` where the target is a source path but no
+        # extension literal appears. Accept EITHER a literal extension OR a
+        # resolved source path/dir among the command's path-like tokens.
+        has_literal_ext = any(ext in command_lower for ext in _SOURCE_EXTENSIONS)
+        has_source_path = False
+        if not has_literal_ext:
+            for cand in _iter_candidate_paths(command):
+                if _is_source_path(cand) or _is_source_dir(cand):
+                    has_source_path = True
+                    break
+        if not (has_literal_ext or has_source_path):
             return None
         if _take_nudge_slot(session_key, "terminal"):
             return (
