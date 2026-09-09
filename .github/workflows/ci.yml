@@ -31,7 +31,8 @@ jobs:
           pip install tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-rust tree-sitter-go tree-sitter-java ast-grep-py pytest pytest-timeout
           # Real LSP servers so the live diagnostics tests actually run on CI
           # (typescript-language-server + tsserver for TS, pyright for Python).
-          npm install -g typescript typescript-language-server pyright
+          npm install -g typescript typescript-language-server@5.1.3 pyright
+          npm list -g --depth=0 || true
           npx pyright --version || true
           typescript-language-server --version || true
 
