@@ -20,10 +20,20 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install tree-sitter + ast-grep test deps
+      - name: Set up Node (for real LSP servers)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install tree-sitter + ast-grep + LSP test deps
         run: |
           python -m pip install --upgrade pip
           pip install tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-rust tree-sitter-go tree-sitter-java ast-grep-py pytest
+          # Real LSP servers so the live diagnostics tests actually run on CI
+          # (typescript-language-server + tsserver for TS, pyright for Python).
+          npm install -g typescript typescript-language-server pyright
+          npx pyright --version || true
+          typescript-language-server --version || true
 
       - name: Compile check
         run: |

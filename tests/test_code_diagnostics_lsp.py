@@ -102,6 +102,8 @@ class TestFallbackReasons:
 
     def test_reduced_path_still_finds_server(self, fixtures):
         """Cold subprocess with PATH=/usr/bin:/bin must still run real LSP."""
+        if not _has_server("typescript-language-server"):
+            pytest.skip("typescript-language-server not installed")
         code = (
             "import sys, json\n"
             f"sys.path.insert(0, {str(PLUGIN_DIR)!r})\n"
@@ -125,6 +127,8 @@ class TestFallbackReasons:
     def test_silent_pull_capable_server_reason(self, fixtures):
         """Initialized server, push lost AND pull returns nothing →
         no_diagnostics_response (not the misleading 'server unavailable')."""
+        if not (_has_server("pyright-langserver") or _has_server("pylsp")):
+            pytest.skip("no python LSP server (pyright-langserver/pylsp) installed")
         import lsp_bridge
         from lsp_bridge import code_diagnostics_tool, get_lsp_manager
 
@@ -161,6 +165,8 @@ class TestFallbackReasons:
 
     def test_empty_vs_none_contract(self, fixtures):
         """[] (authoritative clean) must not degrade to AST fallback."""
+        if not _has_server("typescript-language-server"):
+            pytest.skip("typescript-language-server not installed")
         d = _diag(fixtures["clean.ts"])
         assert d["method"] == "lsp"
         assert d["diagnostic_count"] == 0
