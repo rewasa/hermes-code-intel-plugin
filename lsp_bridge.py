@@ -57,10 +57,11 @@ _LSP_REQUEST_TIMEOUT = 15
 
 # Maximum time (seconds) to wait for the server to start and respond to
 # the ``initialize`` handshake.
-# Reduced from 60 → 15: if a server can't init in 15s (warm or cold),
-# it's likely blocked on something (stderr pipe, plugin init, etc.).
-# A 60s timeout just makes Hermes stall for a full minute.
-_LSP_INIT_TIMEOUT = 15
+# 30s: CI runners cold-start tsserver/pyright from network caches; 15s made
+# the *first* initialize time out, which then deadlocked in shutdown()
+# (see RLock note at _init_lock) and stalled the whole suite. 30s covers a
+# cold server; locally warm servers init in <1s.
+_LSP_INIT_TIMEOUT = 30
 
 # How long to keep an idle server alive before shutting it down.
 _LSP_IDLE_TIMEOUT = 300  # 5 minutes
@@ -376,7 +377,7 @@ class LSPBridge:
     _alive: bool = field(default=False, init=False, repr=False)
     _last_activity: float = field(default=0.0, init=False, repr=False)
     _initialized: bool = field(default=False, init=False, repr=False)
-    _init_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _init_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _diagnostics_cache: Dict[str, List[dict]] = field(default_factory=dict, init=False, repr=False)
     _open_documents: set = field(default_factory=set, init=False, repr=False)  # Track open docs to avoid duplicate didOpen
     _reconcile_close_uris: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
