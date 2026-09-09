@@ -326,6 +326,15 @@ _LSP_EXTRA_BIN_DIRS = (
     "/usr/bin",
     str(Path.home() / ".local" / "bin"),
 )
+# Glob-resolved additions (CI/runner npm -g layouts), appended after the
+# static list; missing dirs are skipped silently.
+try:
+    import glob as _glob
+    _LSP_EXTRA_BIN_DIRS = tuple(_LSP_EXTRA_BIN_DIRS) + tuple(
+        sorted(set(_glob.glob("/opt/hostedtoolcache/node/*/x64/bin"))
+               + set(_glob.glob("/opt/hostedtoolcache/node/*/bin"))))
+except Exception:  # pragma: no cover - glob must never break LSP resolution
+    pass
 
 
 def _resolve_command(cmd: str) -> Optional[str]:
