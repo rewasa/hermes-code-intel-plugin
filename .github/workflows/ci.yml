@@ -28,7 +28,7 @@ jobs:
       - name: Install tree-sitter + ast-grep + LSP test deps
         run: |
           python -m pip install --upgrade pip
-          pip install tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-rust tree-sitter-go tree-sitter-java ast-grep-py pytest
+          pip install tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-rust tree-sitter-go tree-sitter-java ast-grep-py pytest pytest-timeout
           # Real LSP servers so the live diagnostics tests actually run on CI
           # (typescript-language-server + tsserver for TS, pyright for Python).
           npm install -g typescript typescript-language-server pyright
@@ -41,4 +41,9 @@ jobs:
 
       - name: Run tests
         run: |
-          python -m pytest -q
+          python -m pytest -q --timeout=120 --timeout-method=thread --maxfail=6 -p faulthandler --junitxml=pytest-result.xml
+      - name: Dump test result summary (always, for debugging hangs)
+        if: always()
+        run: |
+          tail -c 4000 pytest-result.xml || true
+          grep -o 'testcase name="[^"]*"' pytest-result.xml | tail -40 || true
