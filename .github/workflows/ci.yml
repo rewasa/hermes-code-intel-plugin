@@ -40,6 +40,21 @@ jobs:
         run: |
           python -m py_compile code_intel.py lsp_bridge.py __init__.py scripts/health_check.py
 
+      - name: Probe TSLS initialize handshake (diagnose silent no-reply)
+        run: |
+          node -e '
+          const { spawn } = require("child_process");
+          const p = spawn("typescript-language-server", ["--stdio"]);
+          let got = false;
+          p.stdout.on("data", d => { got = true; console.log("TSLS-OUT:", d.toString().slice(0, 200)); });
+          p.stderr.on("data", d => console.log("TSLS-ERR:", d.toString().slice(0, 400)));
+          p.on("exit", (c, s) => console.log("TSLS-EXIT:", c, s));
+          const init = JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{processId:null,rootUri:"file:///tmp",capabilities:{}}});
+          const msg = "Content-Length: " + Buffer.byteLength(init) + "\r\n\r\n" + init;
+          p.stdin.write(msg);
+          setTimeout(() => { if (!got) { console.log("TSLS: NO RESPONSE in 8s"); process.exit(1);} }, 8000);
+          '
+
       - name: Run tests
         run: |
           python -m pytest -q --timeout=120 --timeout-method=thread --maxfail=6 -p faulthandler --junitxml=pytest-result.xml
