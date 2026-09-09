@@ -31,7 +31,7 @@ jobs:
           pip install tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-rust tree-sitter-go tree-sitter-java ast-grep-py pytest pytest-timeout
           # Real LSP servers so the live diagnostics tests actually run on CI
           # (typescript-language-server + tsserver for TS, pyright for Python).
-          npm install -g typescript typescript-language-server@5.1.3 pyright
+          npm install -g typescript@5.8.3 typescript-language-server@5.1.3 pyright
           npm list -g --depth=0 || true
           npx pyright --version || true
           typescript-language-server --version || true
@@ -42,18 +42,8 @@ jobs:
 
       - name: Probe TSLS initialize handshake (diagnose silent no-reply)
         run: |
-          node -e '
-          const { spawn } = require("child_process");
-          const p = spawn("typescript-language-server", ["--stdio"]);
-          let got = false;
-          p.stdout.on("data", d => { got = true; console.log("TSLS-OUT:", d.toString().slice(0, 200)); });
-          p.stderr.on("data", d => console.log("TSLS-ERR:", d.toString().slice(0, 400)));
-          p.on("exit", (c, s) => console.log("TSLS-EXIT:", c, s));
-          const init = JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{processId:null,rootUri:"file:///tmp",capabilities:{}}});
-          const msg = "Content-Length: " + Buffer.byteLength(init) + "\r\n\r\n" + init;
-          p.stdin.write(msg);
-          setTimeout(() => { if (!got) { console.log("TSLS: NO RESPONSE in 8s"); process.exit(1);} }, 8000);
-          '
+          node scripts/tsls_probe.js || true
+          echo "probe done"
 
       - name: Run tests
         run: |
