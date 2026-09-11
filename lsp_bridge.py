@@ -360,7 +360,13 @@ def _resolve_command(cmd: str) -> Optional[str]:
         return found
     if os.sep in cmd or "/" in cmd:
         return None  # explicit path given — do not second-guess
-    for d in _lsp_bin_dirs():
+    # Explicit configuration wins over generic fallback dirs. This makes
+    # service/CI installs deterministic when multiple global npm prefixes exist.
+    configured = tuple(
+        d for d in os.environ.get("CODE_INTEL_LSP_BIN_DIRS", "").split(os.pathsep)
+        if d
+    )
+    for d in configured + tuple(d for d in _lsp_bin_dirs() if d not in configured):
         try:
             candidate = Path(d) / cmd
             if candidate.is_file() and os.access(candidate, os.X_OK):

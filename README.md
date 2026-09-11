@@ -155,7 +155,7 @@ pip install tree-sitter tree-sitter-languages ast-grep-py
 > go install golang.org/x/tools/gopls@latest
 > ```
 >
-> The plugin auto-discovers servers via PATH, monorepo `node_modules/.bin`, and `npx` fallback. No additional configuration needed.
+> The plugin auto-discovers servers via PATH, monorepo `node_modules/.bin`, and `npx` fallback. For service or CI launchers with a reduced PATH, set `CODE_INTEL_LSP_BIN_DIRS` to a path-separated list of verified LSP executable directories; this explicit setting is searched before generic fallback directories.
 
 ### Monorepo Support
 

@@ -121,7 +121,17 @@ class TestFallbackReasons:
         # reduced PATH; a fallback must expose resolver/initialization evidence.
         # Without this, LSPBridge logs are invisible and CI only reports AST.
 
-        env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
+        # Preserve only documented LSP-bin configuration. Do not inherit parent
+        # PATH: this remains a cold reduced-PATH regression test.
+        lsp_bin_dirs = os.environ.get("CODE_INTEL_LSP_BIN_DIRS", "")
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(Path.home()),
+            "CODE_INTEL_LSP_BIN_DIRS": lsp_bin_dirs,
+        }
+        assert env["PATH"] == "/usr/bin:/bin"
+        if lsp_bin_dirs:
+            assert _has_server("typescript-language-server")
         proc = subprocess.run(
             [VENV_PYTHON if VENV_PYTHON.exists() else sys.executable, "-c", code],
             capture_output=True, text=True, env=env, timeout=120)
