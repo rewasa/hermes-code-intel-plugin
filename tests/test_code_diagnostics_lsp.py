@@ -105,14 +105,22 @@ class TestFallbackReasons:
         if not _has_server("typescript-language-server"):
             pytest.skip("typescript-language-server not installed")
         code = (
-            "import sys, json\n"
+            "import sys, json, logging\n"
             f"sys.path.insert(0, {str(PLUGIN_DIR)!r})\n"
-            "from lsp_bridge import code_diagnostics_tool\n"
-            "d = json.loads(code_diagnostics_tool(%r))\n"
+            "logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)\n"
+            "import lsp_bridge\n"
+            "d = json.loads(lsp_bridge.code_diagnostics_tool(%r))\n"
             "print(json.dumps({'method': d.get('method'),"
             " 'count': d.get('diagnostic_count'),"
-            " 'server': d.get('lsp_server')}))\n"
+            " 'server': d.get('lsp_server'),"
+            " 'reason': d.get('fallback_reason'),"
+            " 'resolved': lsp_bridge._resolve_command('typescript-language-server'),"
+            " 'extra_dirs': lsp_bridge._LSP_EXTRA_BIN_DIRS}))\n"
         ) % fixtures["error.ts"]
+        # Keep child stderr in the assertion. CI runs this under a deliberately
+        # reduced PATH; a fallback must expose resolver/initialization evidence.
+        # Without this, LSPBridge logs are invisible and CI only reports AST.
+
         env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
         proc = subprocess.run(
             [VENV_PYTHON if VENV_PYTHON.exists() else sys.executable, "-c", code],
@@ -120,9 +128,10 @@ class TestFallbackReasons:
         assert proc.returncode == 0, proc.stderr[-300:]
         result_line = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")][-1]
         d = json.loads(result_line)
-        assert d["method"] == "lsp", proc.stdout[-300:]
-        assert d["server"] == "typescript-language-server"
-        assert d["count"] >= 1
+        evidence = (proc.stdout + "\nSTDERR:\n" + proc.stderr)[-4000:]
+        assert d["method"] == "lsp", evidence
+        assert d["server"] == "typescript-language-server", evidence
+        assert d["count"] >= 1, evidence
 
     def test_silent_pull_capable_server_reason(self, fixtures):
         """Initialized server, push lost AND pull returns nothing →
