@@ -155,7 +155,7 @@ pip install tree-sitter tree-sitter-languages ast-grep-py
 > go install golang.org/x/tools/gopls@latest
 > ```
 >
-> The plugin auto-discovers servers via PATH, monorepo `node_modules/.bin`, and `npx` fallback. No additional configuration needed.
+> The plugin auto-discovers servers via PATH, monorepo `node_modules/.bin`, and `npx` fallback. For service or CI launchers with a reduced PATH, set `CODE_INTEL_LSP_BIN_DIRS` to a path-separated list of verified LSP executable directories; this explicit setting is searched before generic fallback directories.
 
 ### Monorepo Support
 
@@ -425,3 +425,29 @@ Contributions welcome! This is a community plugin — PRs for new languages, bet
 - [pyright](https://github.com/microsoft/pyright) — Python LSP server (fallback)
 - [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server) — TypeScript/JavaScript LSP server
 - [tsserver](https://github.com/microsoft/TypeScript) — TypeScript language service (used by typescript-language-server)
+
+## Durability & Revision Pinning
+
+The nightly maintenance gate needs a **source-controlled known-good revision**
+of this plugin. The pin lives in the scripts repo
+(`~/.hermes/scripts/code_intel_plugin_manifest.json`, fields: `pin_revision`,
+`branch`, `remote`, `minimum_compatible`).
+
+`~/.hermes/scripts/code_intel_plugin_restore.py` verifies the live checkout
+against that pin. It is read-only by default and never touches foreign WIP:
+
+| Live checkout state | Action |
+|---|---|
+| clean, matches pin | OK |
+| clean, newer healthy revision (descendant of pin or listed in `minimum_compatible`) | OK (no downgrade) |
+| dirty | pin-revision content verified independently (`git show pin:path`); WIP kept untouched |
+| checkout absent | restore into a disposable fixture dir from the pushed remote; live location never modified |
+| conflicting/drifted | fail visibly with remediation hints; WIP never destroyed |
+
+The health checker resolves the authoritative loaded plugin source for its
+diagnostics fixtures: the profile plugin symlink target when it resolves to the
+live repo, else the pinned revision rendered into a disposable fixture dir.
+A symlink alone is never sufficient — actual bytes/behavior are validated.
+
+Manual: `code_intel_plugin_restore.py [--json] [--restore]` (`--restore`
+creates a disposable recovery fixture, nothing else).

@@ -57,10 +57,11 @@ _LSP_REQUEST_TIMEOUT = 15
 
 # Maximum time (seconds) to wait for the server to start and respond to
 # the ``initialize`` handshake.
-# Reduced from 60 → 15: if a server can't init in 15s (warm or cold),
-# it's likely blocked on something (stderr pipe, plugin init, etc.).
-# A 60s timeout just makes Hermes stall for a full minute.
-_LSP_INIT_TIMEOUT = 15
+# 30s: CI runners cold-start tsserver/pyright from network caches; 15s made
+# the *first* initialize time out, which then deadlocked in shutdown()
+# (see RLock note at _init_lock) and stalled the whole suite. 30s covers a
+# cold server; locally warm servers init in <1s.
+_LSP_INIT_TIMEOUT = 30
 
 # How long to keep an idle server alive before shutting it down.
 _LSP_IDLE_TIMEOUT = 300  # 5 minutes
@@ -318,9 +319,62 @@ def _find_workspace_folders(root: str) -> List[str]:
     return folders
 
 
+_LSP_EXTRA_BIN_DIRS = (
+    "/opt/homebrew/bin",       # Apple Silicon Homebrew (npm -g LSP servers)
+    "/opt/homebrew/opt/node/bin",
+    "/usr/local/bin",          # Intel Homebrew + manual installs
+    "/usr/bin",
+    str(Path.home() / ".local" / "bin"),
+)
+# Explicit extra bins for service/CI launchers. The installer records the
+# verified directory after resolving each global LSP executable. A child can
+# then start under PATH=/usr/bin:/bin without relying on a parent shell PATH.
+_LSP_ENV_BIN_DIRS = tuple(
+    d for d in os.environ.get("CODE_INTEL_LSP_BIN_DIRS", "").split(os.pathsep)
+    if d
+)
+_LSP_EXTRA_BIN_DIRS = tuple(_LSP_EXTRA_BIN_DIRS) + _LSP_ENV_BIN_DIRS
+
+
+def _lsp_bin_dirs() -> Tuple[str, ...]:
+    """Return static plus current-process configured LSP bin directories."""
+    dynamic = tuple(
+        d for d in os.environ.get("CODE_INTEL_LSP_BIN_DIRS", "").split(os.pathsep)
+        if d
+    )
+    return tuple(dict.fromkeys(_LSP_EXTRA_BIN_DIRS + dynamic))
+
+
 def _resolve_command(cmd: str) -> Optional[str]:
-    """Return the full path for *cmd* if it exists on ``$PATH``, else ``None``."""
-    return shutil.which(cmd)
+    """Return the full path for *cmd* if it exists, else ``None``.
+
+    ``shutil.which`` only searches ``$PATH``. Scheduled/daemon launch contexts
+    (launchd, Paseo workers, nightly maintenance) frequently run with a reduced
+    PATH that omits ``/opt/homebrew/bin``, which silently hides globally
+    installed LSP servers (typescript-language-server, pyright-langserver).
+    Fall back to the well-known install dirs so server discovery is
+    PATH-independent.
+    """
+    found = shutil.which(cmd)
+    if found:
+        return found
+    if os.sep in cmd or "/" in cmd:
+        return None  # explicit path given — do not second-guess
+    # Explicit configuration wins over generic fallback dirs. This makes
+    # service/CI installs deterministic when multiple global npm prefixes exist.
+    configured = tuple(
+        d for d in os.environ.get("CODE_INTEL_LSP_BIN_DIRS", "").split(os.pathsep)
+        if d
+    )
+    for d in configured + tuple(d for d in _lsp_bin_dirs() if d not in configured):
+        try:
+            candidate = Path(d) / cmd
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                logger.info("LSP server %s not on PATH, resolved via fallback dir: %s", cmd, candidate)
+                return str(candidate)
+        except OSError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -346,11 +400,16 @@ class LSPBridge:
     _alive: bool = field(default=False, init=False, repr=False)
     _last_activity: float = field(default=0.0, init=False, repr=False)
     _initialized: bool = field(default=False, init=False, repr=False)
-    _init_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _init_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _diagnostics_cache: Dict[str, List[dict]] = field(default_factory=dict, init=False, repr=False)
     _open_documents: set = field(default_factory=set, init=False, repr=False)  # Track open docs to avoid duplicate didOpen
     _reconcile_close_uris: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _doc_versions: Dict[str, int] = field(default_factory=dict, init=False, repr=False)  # textDocument version per URI for didChange
+    # mtime at which each file was last analysed (validates cached diagnostics)
+    _diag_mtime: Dict[str, Optional[float]] = field(default_factory=dict, init=False, repr=False)
+    # Server capabilities from the initialize response (used to decide whether
+    # pull diagnostics (textDocument/diagnostic) can possibly work at all).
+    init_capabilities: dict = field(default_factory=dict, init=False, repr=False)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -366,6 +425,14 @@ class LSPBridge:
         # TypeScript: ensure TSServer can resolve types from workspace
         if self.language_id in ("typescript", "typescriptreact", "javascript", "javascriptreact"):
             env["TSS_LOG"] = "-"  # Log to stderr (captured, not lost)
+        # Reduced-PATH launch contexts (launchd, schedulers): LSP wrappers like
+        # typescript-language-server carry a `#!/usr/bin/env node` shebang and
+        # cannot exec node unless its dir is on the child PATH. Add the same
+        # fallback dirs used by _resolve_command, preserving any existing PATH.
+        existing_path = env.get("PATH", "")
+        extra = [d for d in _LSP_EXTRA_BIN_DIRS if d not in existing_path.split(os.pathsep)]
+        if extra:
+            env["PATH"] = os.pathsep.join([existing_path] + extra) if existing_path else os.pathsep.join(extra)
         return env
 
     def _get_initialization_options(self) -> Dict[str, Any]:
@@ -452,6 +519,14 @@ class LSPBridge:
                         "hover": {"dynamicRegistration": False, "contentFormat": ["plaintext", "markdown"]},
                         "typeDefinition": {"dynamicRegistration": False},
                         "rename": {"dynamicRegistration": False, "prepareSupport": True},
+                        # typescript-language-server only publishes diagnostics
+                        # when client explicitly advertises this LSP capability.
+                        "publishDiagnostics": {
+                            "relatedInformation": True,
+                            "versionSupport": True,
+                            "codeDescriptionSupport": True,
+                            "dataSupport": True,
+                        },
                     },
                     "workspace": {
                         "symbol": {"dynamicRegistration": False},
@@ -477,6 +552,7 @@ class LSPBridge:
             # Send initialized notification
             self._send_notification("initialized", {})
             self._initialized = True
+            self.init_capabilities = init_result.get("capabilities", {}) or {}
             server_info = init_result.get("serverInfo", {})
             logger.info("LSP server initialized: %s (%s %s) in %.1fs",
                 self.command,
@@ -1274,10 +1350,22 @@ class LSPBridge:
         if not self.ensure_initialized():
             return None
         uri = f"file://{file_path}"
+        on_disk_mtime = _safe_mtime(file_path)
+        with self._lock:
+            cached = self._diagnostics_cache.get(file_path)
+            already_open = uri in self._open_documents
+            last_mtime = self._diag_mtime.get(file_path)
+        # Fast path: document already open and the on-disk file is unchanged
+        # since the last analysis -> the cached result is still authoritative.
+        # TSLS (server-side) dedupes repeated empty results and would NOT
+        # re-publish for an unchanged clean file, so a blind cache-pop + wait
+        # here would wrongly return None ("no push") for a perfectly healthy
+        # server. Only skip the fast path when there is nothing cached yet.
+        if already_open and cached is not None and last_mtime == on_disk_mtime:
+            return cached
         # Drop any stale push so we can detect the *fresh* one for this call.
         with self._lock:
             self._diagnostics_cache.pop(file_path, None)
-            already_open = uri in self._open_documents
         if already_open:
             # didOpen would be a no-op on an open document, so the server would
             # not re-analyse. A didChange (full sync, bumped version) forces a
@@ -1312,7 +1400,10 @@ class LSPBridge:
                     break
             time.sleep(0.05)
         with self._lock:
-            return self._diagnostics_cache.get(file_path)
+            result = self._diagnostics_cache.get(file_path)
+            if result is not None:
+                self._diag_mtime[file_path] = on_disk_mtime
+            return result
 
     def get_server_info(self) -> dict:
         """Return basic health info about this bridge."""
@@ -1510,6 +1601,14 @@ def get_lsp_manager() -> LSPManager:
 # ---------------------------------------------------------------------------
 # Public tool functions
 # ---------------------------------------------------------------------------
+
+
+def _safe_mtime(file_path: str) -> Optional[float]:
+    """Best-effort file mtime; ``None`` when unreadable (still safe to compare)."""
+    try:
+        return Path(file_path).stat().st_mtime
+    except OSError:
+        return None
 
 
 def _detect_language_for_lsp(file_path: str) -> Optional[str]:
@@ -1789,6 +1888,17 @@ def code_diagnostics_tool(
                 return _json.dumps(summary, indent=2)
 
     # No push arrived — try pull diagnostics (LSP 3.17+, servers that support it)
+    # Note: pyright answers textDocument/diagnostic but does NOT advertise a
+    # diagnosticProvider capability, so treat pyright-family servers as pull-
+    # capable even without the advertised capability.
+    pull_supported = False
+    if bridge is not None:
+        try:
+            pull_supported = bool(
+                (bridge.init_capabilities or {}).get("diagnosticProvider")
+            ) or "pyright" in (bridge.command or "")
+        except Exception:
+            pull_supported = False
     if bridge and bridge.ensure_initialized():
         try:
             resp = bridge._send_request("textDocument/diagnostic", {
@@ -1814,7 +1924,17 @@ def code_diagnostics_tool(
 
     # Fallback: AST heuristic (no LSP server, or server reported nothing in time)
     logger.debug("code_diagnostics: using AST fallback")
-    return _ast_fallback_diagnostics(str(target), lang)
+    if lang is None:
+        fallback_reason = "unsupported_language"
+    elif bridge is None:
+        fallback_reason = "lsp_server_unavailable"
+    elif not bridge.ensure_initialized():
+        fallback_reason = "lsp_init_failed"
+    elif not pull_supported:
+        fallback_reason = "no_diagnostics_support"
+    else:
+        fallback_reason = "no_diagnostics_response"
+    return _ast_fallback_diagnostics(str(target), lang, fallback_reason=fallback_reason)
 
 
 def code_callers_tool(
@@ -2208,7 +2328,11 @@ def _ast_fallback_references(
         })
 
 
-def _ast_fallback_diagnostics(file_path: str, lang: Optional[str]) -> str:
+def _ast_fallback_diagnostics(
+    file_path: str,
+    lang: Optional[str],
+    fallback_reason: str = "lsp_unavailable",
+) -> str:
     """Lightweight AST-based heuristic for common issues: unused imports, undefined names."""
     import json as _json
     content = ""
@@ -2287,7 +2411,8 @@ def _ast_fallback_diagnostics(file_path: str, lang: Optional[str]) -> str:
     return _json.dumps({
         "path": file_path,
         "method": "ast_heuristic",
-        "warning": "LSP server unavailable. Using lightweight AST heuristic.",
+        "warning": f"LSP diagnostics unavailable ({fallback_reason}). Using lightweight AST heuristic.",
+        "fallback_reason": fallback_reason,
         "diagnostic_count": len(diagnostics),
         "errors": len([d for d in diagnostics if d.get("severity", 1) == 1]),
         "warnings": len([d for d in diagnostics if d.get("severity", 2) == 2]),

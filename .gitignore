@@ -9,3 +9,5 @@ patch_*.py
 # Self-referential symlink guard — the repo root may be symlinked into a
 # profile plugins dir; never let that link be committed or scanned recursively.
 code-intel-plugin
+# Generated diagnostics test fixtures (rewritten by ci_diag_fixtures.ensure_fixtures)
+tests/.fixtures/

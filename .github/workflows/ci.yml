@@ -20,15 +20,40 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install tree-sitter + ast-grep test deps
+      - name: Set up Node (for real LSP servers)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install tree-sitter + ast-grep + LSP test deps
         run: |
           python -m pip install --upgrade pip
-          pip install tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-rust tree-sitter-go tree-sitter-java ast-grep-py pytest
+          pip install tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-rust tree-sitter-go tree-sitter-java ast-grep-py pytest pytest-timeout
+          # Real LSP servers so the live diagnostics tests actually run on CI
+          # (typescript-language-server + tsserver for TS, pyright for Python).
+          npm install -g typescript@5.8.3 typescript-language-server@5.1.3 pyright
+          LSP_BIN_DIR="$(dirname "$(command -v typescript-language-server)")"
+          test -x "$LSP_BIN_DIR/typescript-language-server"
+          test -x "$LSP_BIN_DIR/node"
+          echo "CODE_INTEL_LSP_BIN_DIRS=$LSP_BIN_DIR" >> "$GITHUB_ENV"
+          npm list -g --depth=0 || true
+          npx pyright --version || true
+          typescript-language-server --version || true
 
       - name: Compile check
         run: |
           python -m py_compile code_intel.py lsp_bridge.py __init__.py scripts/health_check.py
 
+      - name: Probe TSLS initialize handshake (diagnose silent no-reply)
+        run: |
+          node scripts/tsls_probe.js || true
+          echo "probe done"
+
       - name: Run tests
         run: |
-          python -m pytest -q
+          python -m pytest -q --timeout=120 --timeout-method=thread --maxfail=6 -p faulthandler --junitxml=pytest-result.xml
+      - name: Dump test result summary (always, for debugging hangs)
+        if: always()
+        run: |
+          tail -c 4000 pytest-result.xml || true
+          grep -o 'testcase name="[^"]*"' pytest-result.xml | tail -40 || true
