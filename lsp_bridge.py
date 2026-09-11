@@ -326,15 +326,23 @@ _LSP_EXTRA_BIN_DIRS = (
     "/usr/bin",
     str(Path.home() / ".local" / "bin"),
 )
-# Glob-resolved additions (CI/runner npm -g layouts), appended after the
-# static list; missing dirs are skipped silently.
-try:
-    import glob as _glob
-    _LSP_EXTRA_BIN_DIRS = tuple(_LSP_EXTRA_BIN_DIRS) + tuple(
-        sorted(set(_glob.glob("/opt/hostedtoolcache/node/*/x64/bin"))
-               + set(_glob.glob("/opt/hostedtoolcache/node/*/bin"))))
-except Exception:  # pragma: no cover - glob must never break LSP resolution
-    pass
+# Explicit extra bins for service/CI launchers. The installer records the
+# verified directory after resolving each global LSP executable. A child can
+# then start under PATH=/usr/bin:/bin without relying on a parent shell PATH.
+_LSP_ENV_BIN_DIRS = tuple(
+    d for d in os.environ.get("CODE_INTEL_LSP_BIN_DIRS", "").split(os.pathsep)
+    if d
+)
+_LSP_EXTRA_BIN_DIRS = tuple(_LSP_EXTRA_BIN_DIRS) + _LSP_ENV_BIN_DIRS
+
+
+def _lsp_bin_dirs() -> Tuple[str, ...]:
+    """Return static plus current-process configured LSP bin directories."""
+    dynamic = tuple(
+        d for d in os.environ.get("CODE_INTEL_LSP_BIN_DIRS", "").split(os.pathsep)
+        if d
+    )
+    return tuple(dict.fromkeys(_LSP_EXTRA_BIN_DIRS + dynamic))
 
 
 def _resolve_command(cmd: str) -> Optional[str]:
@@ -352,7 +360,7 @@ def _resolve_command(cmd: str) -> Optional[str]:
         return found
     if os.sep in cmd or "/" in cmd:
         return None  # explicit path given — do not second-guess
-    for d in _LSP_EXTRA_BIN_DIRS:
+    for d in _lsp_bin_dirs():
         try:
             candidate = Path(d) / cmd
             if candidate.is_file() and os.access(candidate, os.X_OK):
