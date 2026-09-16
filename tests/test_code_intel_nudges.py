@@ -105,12 +105,39 @@ def test_terminal_grep_without_grep_word_silent(tmp_path):
 
 
 def test_terminal_nudge_rate_limited(tmp_path):
+    """Budget must bind EXACTLY at _MAX_NUDGE_PER_TOOL, not merely 'at most'.
+
+    The old assertion (`fired <= budget` over 5 iterations) passed trivially
+    once the budget was raised from 3 to 12 — it could no longer detect a
+    broken or absent rate limit. Drive it past the budget and assert equality.
+    """
     d = make_src_dir(tmp_path)
     fired = 0
-    for _ in range(5):
-        if _build("terminal", {"command": "grep -r foo %s" % d}) is not None:
+    for _ in range(n._MAX_NUDGE_PER_TOOL + 5):
+        if _build("terminal", {"command": "grep -r foo %s" % d},
+                  session="rate-limit-sess") is not None:
             fired += 1
-    assert fired <= n._MAX_NUDGE_PER_TOOL
+    assert fired == n._MAX_NUDGE_PER_TOOL
+
+
+def test_nudge_budget_env_override(monkeypatch):
+    """CODE_INTEL_MAX_NUDGE_PER_TOOL drives the budget; junk falls back."""
+    monkeypatch.setenv("CODE_INTEL_MAX_NUDGE_PER_TOOL", "7")
+    assert n._read_nudge_budget() == 7
+    monkeypatch.setenv("CODE_INTEL_MAX_NUDGE_PER_TOOL", "0")
+    assert n._read_nudge_budget() == 0        # 0 = nudging off, a valid A/B arm
+    monkeypatch.setenv("CODE_INTEL_MAX_NUDGE_PER_TOOL", "nonsense")
+    assert n._read_nudge_budget(12) == 12     # never raise on a typo'd env var
+    monkeypatch.setenv("CODE_INTEL_MAX_NUDGE_PER_TOOL", "-4")
+    assert n._read_nudge_budget(12) == 12
+    monkeypatch.delenv("CODE_INTEL_MAX_NUDGE_PER_TOOL")
+    assert n._read_nudge_budget(12) == 12
+
+
+def test_nudge_budget_default_raised_above_legacy_three():
+    """Guards the actual point of this change: the legacy budget of 3 was
+    exhausted within minutes of a 500+-call builder session."""
+    assert n._read_nudge_budget() >= 10
 
 
 # ---------------------------------------------------------------------------

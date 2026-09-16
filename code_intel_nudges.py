@@ -54,11 +54,41 @@ _SOURCE_EXTENSIONS = {
     ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rs", ".go", ".java",
 }
 
-# Max nudges per (session_id, trigger-type). Extends the same budget the
-# dead CodeIntelSteering class used (_MAX_NUDGE_PER_TOOL = 3), just wired
-# through a hook that actually fires. NOTE: this is PER trigger-type — see
-# module docstring, up to 4x this value per session across all triggers.
-_MAX_NUDGE_PER_TOOL = 3
+# Max nudges per (session_id, trigger-type). Inherited from the dead
+# CodeIntelSteering class (3), which was far too low to matter: builder
+# sessions routinely run 500+ tool calls, so a 3-per-trigger budget is
+# exhausted in the first minutes and the remaining ~99% of the session sees
+# nothing. Measured consequence: code_intel at 1.19% of 240,752 calls over
+# 30 days (baseline 2026-09-16, ~/.hermes/metrics/code_intel_adoption.jsonl).
+#
+# Raised to 12 per trigger-type (4 trigger-types => up to 48 per session).
+# Bounded on purpose: the nudge is a one-line suffix (~120 chars), so the
+# worst case is ~6 KB of hints across a whole long session — negligible next
+# to the tool payloads themselves, and each hint targets a call the agent
+# just made with a worse tool.
+#
+# Override per environment with CODE_INTEL_MAX_NUDGE_PER_TOOL (0 disables
+# nudging entirely) so the effect can be A/B-measured without a code change.
+# NOTE: this is PER trigger-type — see module docstring.
+def _read_nudge_budget(default: int = 12) -> int:
+    """Read the per-trigger nudge budget from env, falling back to *default*.
+
+    Invalid or negative values fall back to the default rather than throwing:
+    a typo'd env var must never break tool-result handling for every call.
+    """
+    import os
+
+    raw = os.environ.get("CODE_INTEL_MAX_NUDGE_PER_TOOL")
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+_MAX_NUDGE_PER_TOOL = _read_nudge_budget()
 
 # Below this, reading the whole file is cheaper than a code_symbols round-trip.
 _MIN_LINES_FOR_SYMBOLS_NUDGE = 200
