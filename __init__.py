@@ -398,8 +398,10 @@ def register(ctx: PluginContext) -> None:
         # ── FORCE code_intel into every subagent + inject steering ──
         # Renato's rule: code_intel must be DEFAULT for ALL agents, and
         # subagents must KNOW which tools exist and how to use them.
-        if "code_intel" not in dt.DEFAULT_TOOLSETS:
-            dt.DEFAULT_TOOLSETS.append("code_intel")
+        from tools.delegate_tool_toolsets import DEFAULT_TOOLSETS
+
+        if "code_intel" not in DEFAULT_TOOLSETS:
+            DEFAULT_TOOLSETS.append("code_intel")
 
         _CODE_INTEL_STEERING = (
             "\n\n## 🧠 Code Intelligence Tools (PREFER over read_file/grep/patch)\n"
