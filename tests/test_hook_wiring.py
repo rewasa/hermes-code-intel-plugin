@@ -5,9 +5,18 @@ hook is registered by ``register(ctx)`` and that it responds to the *production*
 pre_llm_call payload shape, which is the part that was silently dead.
 
 Hermes runtime modules are stubbed so the plugin can be imported outside a
-running agent.
+running agent. The stubs are installed by ``_install_runtime_stubs`` and are
+shared by every test that calls ``register()`` — including the old-core
+degradation test, which previously ran without the ``toolsets`` stub and died
+with ``ModuleNotFoundError: No module named 'toolsets'`` for the wrong reason.
+
+Section validation is asserted against ``tests/hermes_core_contract.py`` (the
+checked record of the core's rules), and ``test_section_contract_matches_real_core``
+compares that record against the LIVE core whenever ``hermes_cli`` is importable,
+so the record cannot drift from the real validation rules.
 """
 
+import importlib.util as _ilu
 import json
 import sys
 import types
@@ -17,6 +26,17 @@ import pytest
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_DIR.parent))
+
+from hermes_core_contract import (  # noqa: E402
+    CORE_CONTRACT,
+    MAX_SYSTEM_PROMPT_SECTION_CHARS,
+    PLUGIN_SECTIONS_END,
+    PLUGIN_SECTIONS_START,
+    SYSTEM_PROMPT_SECTION_POSITIONS,
+    contract_drift,
+    is_valid_system_prompt_section_id,
+    validate_section,
+)
 
 pytest.importorskip("tree_sitter", reason="tree-sitter not installed")
 
@@ -60,48 +80,92 @@ class FakeCtx:
                                            "max_chars": max_chars}
 
 
-@pytest.fixture()
-def plugin(monkeypatch):
-    """Import the plugin package with stubbed Hermes runtime modules."""
-    import sys as _sys
+def _optional_import(module_name: str):
+    """Import an optional Hermes-core module; return ``None`` when unavailable.
 
+    Deliberately narrow: only ``ModuleNotFoundError`` counts as "core absent"
+    (the standalone CI case). Any other failure is a real defect and propagates.
+
+    ``sys.path`` is restored before returning: leaving the Hermes install dir on
+    the path would make unrelated ``pytest.importorskip("tools.registry")``
+    guards in this suite resolve the REAL Hermes runtime instead of skipping,
+    turning those tests into order-dependent failures.
+    """
+    hermes_home = str(Path.home() / ".hermes" / "hermes-agent")
+    added = hermes_home not in sys.path and Path(hermes_home).is_dir()
+    if added:
+        sys.path.insert(0, hermes_home)
+    try:
+        return __import__(module_name, fromlist=["*"])
+    except ModuleNotFoundError:
+        return None
+    finally:
+        if added:
+            try:
+                sys.path.remove(hermes_home)
+            except ValueError:
+                pass
+
+
+def _install_runtime_stubs(monkeypatch):
+    """Install the Hermes runtime modules the plugin touches during register().
+
+    ``register()`` unconditionally does ``import toolsets`` and reads
+    ``toolsets.TOOLSETS`` / ``toolsets._HERMES_CORE_TOOLS`` (real Hermes cores
+    always ship those), and probes ``hermes_cli.plugins.VALID_HOOKS``. A test
+    that calls ``register()`` without this stub cannot reach the code under test
+    at all. Returns the fake toolset module and fake registry.
+    """
     fake_registry = FakeRegistry()
 
     toolsets = types.ModuleType("toolsets")
     toolsets.TOOLSETS = {}
     toolsets._HERMES_CORE_TOOLS = []
-    monkeypatch.setitem(_sys.modules, "toolsets", toolsets)
+    monkeypatch.setitem(sys.modules, "toolsets", toolsets)
 
     tools_mod = types.ModuleType("tools")
     registry_mod = types.ModuleType("tools.registry")
     registry_mod.registry = fake_registry
     tools_mod.registry = registry_mod
-    monkeypatch.setitem(_sys.modules, "tools", tools_mod)
-    monkeypatch.setitem(_sys.modules, "tools.registry", registry_mod)
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.registry", registry_mod)
 
     plugins_mod = types.ModuleType("hermes_cli.plugins")
-    plugins_mod.VALID_HOOKS = {
-        "pre_llm_call", "on_session_end", "transform_tool_result",
-    }
-    monkeypatch.setitem(_sys.modules, "hermes_cli.plugins", plugins_mod)
+    setattr(plugins_mod, "VALID_HOOKS", set(CORE_CONTRACT["REQUIRED_HOOKS"]))
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins_mod)
 
-    # Install the real plugin package as ``code_intel`` (replacing the
-    # conftest namespace shim) so both the entrypoint and its relative
-    # imports (``from .code_intel import ...``) resolve to this checkout.
-    import importlib.util as _ilu
+    return toolsets, fake_registry
 
-    for stale in [k for k in list(_sys.modules) if k == "code_intel" or k.startswith("code_intel.")]:
-        del _sys.modules[stale]
+
+def _import_plugin_entrypoint(monkeypatch, name="code_intel"):
+    """Exec the real plugin ``__init__.py`` as a package named *name*.
+
+    The package alias is registered through ``monkeypatch`` so pytest restores
+    ``sys.modules[name]`` to THIS repo's package on teardown — the repo root also
+    ships a flat ``code_intel.py``, and a leaked alias would make every later
+    ``from code_intel.<submodule> import ...`` fail with
+    ``'code_intel' is not a package``.
+    """
+    for stale in [k for k in list(sys.modules) if k == name or k.startswith(name + ".")]:
+        del sys.modules[stale]
 
     spec = _ilu.spec_from_file_location(
-        "code_intel",
+        name,
         PLUGIN_DIR / "__init__.py",
         submodule_search_locations=[str(PLUGIN_DIR)],
     )
     assert spec is not None and spec.loader is not None
     mod = _ilu.module_from_spec(spec)
-    monkeypatch.setitem(_sys.modules, "code_intel", mod)
+    monkeypatch.setitem(sys.modules, name, mod)
     spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture()
+def plugin(monkeypatch):
+    """Import the plugin package with stubbed Hermes runtime modules."""
+    _toolsets, fake_registry = _install_runtime_stubs(monkeypatch)
+    mod = _import_plugin_entrypoint(monkeypatch)
     ctx = FakeCtx()
     mod.register(ctx)
     return mod, ctx, fake_registry
@@ -218,21 +282,43 @@ def test_system_prompt_section_registered_and_valid(plugin):
     _mod, ctx, _reg = plugin
     assert "code-intel.defaults" in ctx.system_prompt_sections
     section = ctx.system_prompt_sections["code-intel.defaults"]
-    content = section["content"]
 
-    from hermes_cli.plugins_dispatch import (
-        MAX_SYSTEM_PROMPT_SECTION_CHARS,
-        PLUGIN_SECTIONS_END,
-        PLUGIN_SECTIONS_START,
-        SYSTEM_PROMPT_SECTION_POSITIONS,
-        is_valid_system_prompt_section_id,
-    )
+    # Full core acceptance rules, mirrored from hermes_cli.plugins_dispatch and
+    # drift-checked against the live core in test_section_contract_matches_real_core.
+    content = validate_section("code-intel.defaults", section)
 
     assert is_valid_system_prompt_section_id("code-intel.defaults")
     assert section["position"] in SYSTEM_PROMPT_SECTION_POSITIONS
     assert 0 < len(content) <= section["max_chars"] <= MAX_SYSTEM_PROMPT_SECTION_CHARS
     assert PLUGIN_SECTIONS_START not in content and PLUGIN_SECTIONS_END not in content
     assert content.strip()
+
+
+def test_section_contract_matches_real_core():
+    """The recorded core contract must not drift from the live Hermes core.
+
+    CI has no Hermes install, so the standalone section assertions use the
+    record in ``hermes_core_contract``. This test is the guard that keeps that
+    record honest: it runs wherever ``hermes_cli`` IS importable (the Hermes
+    venv / a developer machine) and fails on any constant or id-charset drift.
+    """
+    core_dispatch = _optional_import("hermes_cli.plugins_dispatch")
+    core_plugins = _optional_import("hermes_cli.plugins")
+    if core_dispatch is None or core_plugins is None:
+        pytest.skip("Hermes core (hermes_cli) not importable in this environment")
+
+    drift = contract_drift(core_dispatch) + contract_drift(core_plugins)
+    assert not drift, (
+        "Hermes core no longer matches tests/hermes_core_contract.py:\n  "
+        + "\n  ".join(sorted(set(drift)))
+    )
+
+    # Hook allowlist half of the contract (only hermes_cli.plugins has it).
+    missing = set(CORE_CONTRACT["REQUIRED_HOOKS"]) - set(core_plugins.VALID_HOOKS)
+    assert not missing, (
+        "registered hooks absent from the live core's VALID_HOOKS: "
+        f"{sorted(missing)} — they would be accepted and never invoked"
+    )
 
 
 def test_system_prompt_section_names_one_tool_per_job(plugin):
@@ -247,18 +333,14 @@ def test_system_prompt_section_names_one_tool_per_job(plugin):
 
 
 def test_system_prompt_section_degrades_on_old_core(monkeypatch):
-    """A core without register_system_prompt_section must not abort register()."""
-    import importlib.util as _ilu
+    """A core without register_system_prompt_section must not abort register().
 
-    for stale in [k for k in list(sys.modules) if k == "code_intel" or k.startswith("code_intel.")]:
-        del sys.modules[stale]
-
-    spec = _ilu.spec_from_file_location(
-        "code_intel", PLUGIN_DIR / "__init__.py",
-        submodule_search_locations=[str(PLUGIN_DIR)])
-    mod = _ilu.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, "code_intel", mod)
-    spec.loader.exec_module(mod)
+    Uses the same runtime stubs as the ``plugin`` fixture: ``register()`` may
+    only fail for the *specific* old-core API it is meant to tolerate, never
+    because of an unstubbed ``toolsets`` import.
+    """
+    _install_runtime_stubs(monkeypatch)
+    mod = _import_plugin_entrypoint(monkeypatch)
 
     class OldCtx(FakeCtx):
         register_system_prompt_section = None  # attribute present but not callable
