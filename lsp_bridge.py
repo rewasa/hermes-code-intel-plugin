@@ -88,6 +88,10 @@ _LANGUAGE_SERVERS: Dict[str, List[Dict[str, Any]]] = {
     "jsx": [
         {"command": "typescript-language-server", "args": ["--stdio"], "language_id": "javascriptreact"},
     ],
+    "php": [
+        # intelephense — 由 Hermes 的 LSP staging dir 提供（見 _LSP_EXTRA_BIN_DIRS）
+        {"command": "intelephense", "args": ["--stdio"], "language_id": "php"},
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -319,12 +323,40 @@ def _find_workspace_folders(root: str) -> List[str]:
     return folders
 
 
+def _hermes_lsp_bin() -> str:
+    """Hermes 自己的 LSP staging dir（profile-aware）：<HERMES_HOME>/lsp/bin。
+
+    Windows 上它不在 PATH，所以 bare-name 解析一定要靠這個目錄。
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        return str(Path(get_hermes_home()) / "lsp" / "bin")
+    except Exception:  # standalone / CI import
+        return str(Path.home() / ".hermes" / "lsp" / "bin")
+
+
+def _path_to_uri(path: str) -> str:
+    """File-system path -> ``file://`` URI.
+
+    Windows needs the drive letter as a *path component*: ``file://C:\\x`` is not a
+    valid URI, and servers answer ``initialize`` with an error (intelephense did, which
+    surfaced as "LSP initialize timed out" followed by a silent AST fallback).
+    """
+    from urllib.parse import quote
+
+    p = str(path).replace("\\", "/")
+    if not p.startswith("/"):
+        p = "/" + p
+    return "file://" + quote(p, safe="/:")
+
+
 _LSP_EXTRA_BIN_DIRS = (
     "/opt/homebrew/bin",       # Apple Silicon Homebrew (npm -g LSP servers)
     "/opt/homebrew/opt/node/bin",
     "/usr/local/bin",          # Intel Homebrew + manual installs
     "/usr/bin",
     str(Path.home() / ".local" / "bin"),
+    _hermes_lsp_bin(),
 )
 # Explicit extra bins for service/CI launchers. The installer records the
 # verified directory after resolving each global LSP executable. A child can
@@ -368,10 +400,13 @@ def _resolve_command(cmd: str) -> Optional[str]:
     )
     for d in configured + tuple(d for d in _lsp_bin_dirs() if d not in configured):
         try:
-            candidate = Path(d) / cmd
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                logger.info("LSP server %s not on PATH, resolved via fallback dir: %s", cmd, candidate)
-                return str(candidate)
+            # Windows: npm/Hermes 裝的係 .cmd，bare name 永遠搵唔到。
+            names = [cmd] + ([cmd + s for s in (".cmd", ".exe", ".bat")] if os.name == "nt" else [])
+            for name in names:
+                candidate = Path(d) / name
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    logger.info("LSP server %s not on PATH, resolved via fallback dir: %s", cmd, candidate)
+                    return str(candidate)
         except OSError:
             continue
     return None
@@ -503,13 +538,13 @@ class LSPBridge:
             self._reader_thread.start()
 
             # Initialize handshake
-            root_uri = f"file://{self.root_uri}"
+            root_uri = _path_to_uri(self.root_uri)
             init_params: Dict[str, Any] = {
                 "processId": os.getpid(),
                 "rootUri": root_uri,
                 "rootPath": self.root_uri,
                 "workspaceFolders": [
-                    {"uri": f"file://{f}", "name": Path(f).name}
+                    {"uri": _path_to_uri(f), "name": Path(f).name}
                     for f in self.workspace_folders
                 ] if self.workspace_folders else None,
                 "capabilities": {
@@ -676,15 +711,10 @@ class LSPBridge:
             fd = self._process.stdout.fileno() if self._process and self._process.stdout else None
             while self._alive and self._process and self._process.poll() is None:
                 try:
-                    # Use os.read() to read available bytes without blocking
-                    # (unlike .read(4096) which blocks until 4096 bytes or EOF)
-                    import selectors
-                    sel = selectors.DefaultSelector()
-                    sel.register(self._process.stdout, selectors.EVENT_READ)
-                    ready = sel.select(timeout=1.0)
-                    sel.close()
-                    if not ready:
-                        continue  # No data yet, check if still alive
+                    # 阻塞讀。這個 loop 本身就在自己的 thread，所以直接 block 係正確做法。
+                    # 舊寫法用 selectors.DefaultSelector() 等 pipe：Windows 的 select 只支援
+                    # socket，對 pipe 會拋 OSError [WinError 10093]，而 except 會 break →
+                    # reader thread 一啟動就死，所有 LSP 請求（含 initialize）必然 timeout。
                     chunk = os.read(fd, 65536)
                     if not chunk:
                         break
@@ -851,7 +881,7 @@ class LSPBridge:
         close a document that was *not* actually open. We suppress the known
         reconciliation noise in the log handler.
         """
-        uri = f"file://{file_path}"
+        uri = _path_to_uri(file_path)
         needs_reconcile_close = False
         with self._lock:
             if uri in self._open_documents:
@@ -893,7 +923,7 @@ class LSPBridge:
 
     def close_document(self, file_path: str) -> None:
         """Tell the LSP server to close a document."""
-        uri = f"file://{file_path}"
+        uri = _path_to_uri(file_path)
         self._send_notification("textDocument/didClose", {
             "textDocument": {
                 "uri": uri,
@@ -931,7 +961,7 @@ class LSPBridge:
         t0 = time.monotonic()
         logger.debug("goto_definition: %s:%d:%d", file_path, line, character)
         result = self._send_request("textDocument/definition", {
-            "textDocument": {"uri": f"file://{file_path}"},
+            "textDocument": {"uri": _path_to_uri(file_path)},
             "position": {"line": line, "character": character},
         })
         logger.debug("  definition response in %.2fs, raw keys: %s",
@@ -957,7 +987,7 @@ class LSPBridge:
             if def_path == file_path and def_line == line:
                 logger.debug("  -> import binding detected, trying typeDefinition...")
                 td_result = self._send_request("textDocument/typeDefinition", {
-                    "textDocument": {"uri": f"file://{file_path}"},
+                    "textDocument": {"uri": _path_to_uri(file_path)},
                     "position": {"line": line, "character": character},
                 })
                 td_normalized = self._normalize_locations(td_result)
@@ -972,7 +1002,7 @@ class LSPBridge:
             logger.debug("  definition empty, retrying after 500ms...")
             time.sleep(0.5)
             result2 = self._send_request("textDocument/definition", {
-                "textDocument": {"uri": f"file://{file_path}"},
+                "textDocument": {"uri": _path_to_uri(file_path)},
                 "position": {"line": line, "character": character},
             })
             normalized = self._normalize_locations(result2)
@@ -1009,7 +1039,7 @@ class LSPBridge:
         logger.debug("find_references: %s:%d:%d (includeDeclaration=%s)",
             file_path, line, character, include_declaration)
         result = self._send_request("textDocument/references", {
-            "textDocument": {"uri": f"file://{file_path}"},
+            "textDocument": {"uri": _path_to_uri(file_path)},
             "position": {"line": line, "character": character},
             "context": {"includeDeclaration": include_declaration},
         })
@@ -1024,7 +1054,7 @@ class LSPBridge:
             logger.debug("  references empty, retrying after 500ms...")
             time.sleep(0.5)
             result2 = self._send_request("textDocument/references", {
-                "textDocument": {"uri": f"file://{file_path}"},
+                "textDocument": {"uri": _path_to_uri(file_path)},
                 "position": {"line": line, "character": character},
                 "context": {"includeDeclaration": include_declaration},
             })
@@ -1085,7 +1115,7 @@ class LSPBridge:
             result = self._send_request(
                 "textDocument/rename",
                 {
-                    "textDocument": {"uri": f"file://{file_path}"},
+                    "textDocument": {"uri": _path_to_uri(file_path)},
                     "position": {"line": line, "character": character},
                     "newName": new_name,
                 },
@@ -1108,7 +1138,7 @@ class LSPBridge:
 
         logger.debug("hover: %s:%d:%d", file_path, line, character)
         result = self._send_request("textDocument/hover", {
-            "textDocument": {"uri": f"file://{file_path}"},
+            "textDocument": {"uri": _path_to_uri(file_path)},
             "position": {"line": line, "character": character},
         })
 
@@ -1135,7 +1165,7 @@ class LSPBridge:
             time.sleep(0.05)
 
         result = self._send_request("textDocument/typeDefinition", {
-            "textDocument": {"uri": f"file://{file_path}"},
+            "textDocument": {"uri": _path_to_uri(file_path)},
             "position": {"line": line, "character": character},
         })
 
@@ -1154,7 +1184,7 @@ class LSPBridge:
             time.sleep(0.05)
         try:
             result = self._send_request("textDocument/signatureHelp", {
-                "textDocument": {"uri": f"file://{file_path}"},
+                "textDocument": {"uri": _path_to_uri(file_path)},
                 "position": {"line": line, "character": character},
             })
         except Exception as exc:
@@ -1187,7 +1217,7 @@ class LSPBridge:
             context["only"] = only_kinds
         try:
             result = self._send_request("textDocument/codeAction", {
-                "textDocument": {"uri": f"file://{file_path}"},
+                "textDocument": {"uri": _path_to_uri(file_path)},
                 "range": {
                     "start": {"line": line, "character": character},
                     "end": {"line": end_l, "character": end_c},
@@ -1232,7 +1262,7 @@ class LSPBridge:
         else:
             time.sleep(0.05)
         result = self._send_request("textDocument/diagnostic", {
-            "textDocument": {"uri": f"file://{file_path}"},
+            "textDocument": {"uri": _path_to_uri(file_path)},
         }, timeout=10)
         if result and isinstance(result, dict) and "items" in result:
             return result["items"]
@@ -1252,7 +1282,7 @@ class LSPBridge:
             time.sleep(0.05)
         # Prepare call hierarchy item first
         prep = self._send_request("textDocument/prepareCallHierarchy", {
-            "textDocument": {"uri": f"file://{file_path}"},
+            "textDocument": {"uri": _path_to_uri(file_path)},
             "position": {"line": line, "character": character},
         }, timeout=10)
         if not prep:
@@ -1289,7 +1319,7 @@ class LSPBridge:
         else:
             time.sleep(0.05)
         prep = self._send_request("textDocument/prepareCallHierarchy", {
-            "textDocument": {"uri": f"file://{file_path}"},
+            "textDocument": {"uri": _path_to_uri(file_path)},
             "position": {"line": line, "character": character},
         }, timeout=10)
         if not prep:
@@ -1349,7 +1379,7 @@ class LSPBridge:
         """
         if not self.ensure_initialized():
             return None
-        uri = f"file://{file_path}"
+        uri = _path_to_uri(file_path)
         on_disk_mtime = _safe_mtime(file_path)
         with self._lock:
             cached = self._diagnostics_cache.get(file_path)
@@ -1451,10 +1481,23 @@ class LSPBridge:
 
     @staticmethod
     def _uri_to_path(uri: str) -> str:
-        """Convert a ``file://`` URI to a local path."""
-        if uri.startswith("file://"):
-            return uri[7:]
-        return uri
+        """Convert a ``file://`` URI to a local path (Windows-aware).
+
+        Mirrors the core fix (``agent/lsp/client.py::uri_to_path``): decode first, then
+        drop the leading slash before a drive letter and normalise its case, so URIs
+        round-trip to the same string the path layer uses as a key.
+        """
+        if not uri.startswith("file://"):
+            return uri
+        from urllib.parse import unquote
+
+        raw = unquote(uri[7:])
+        if os.name == "nt" and len(raw) > 2 and raw[0] == "/" and raw[2] == ":" and raw[1].isalpha():
+            raw = raw[1:]
+        path = os.path.normpath(raw)
+        if os.name == "nt" and len(path) > 1 and path[1] == ":" and path[0].isalpha():
+            path = path[0].upper() + path[1:]
+        return path
 
 
 # ---------------------------------------------------------------------------
@@ -1625,6 +1668,7 @@ def _detect_language_for_lsp(file_path: str) -> Optional[str]:
         ".jsx": "jsx",
         ".mjs": "javascript",
         ".cjs": "javascript",
+        ".php": "php",
     }
     lang = lang_map.get(ext)
     logger.debug("detect_language: %s -> %s (ext=%s)", file_path, lang, ext)
@@ -1902,7 +1946,7 @@ def code_diagnostics_tool(
     if bridge and bridge.ensure_initialized():
         try:
             resp = bridge._send_request("textDocument/diagnostic", {
-                "textDocument": {"uri": f"file://{str(target)}"},
+                "textDocument": {"uri": _path_to_uri(str(target))},
                 "identifier": "code_intel",
                 "previousResultId": None,
             }, timeout=10)
