@@ -45,7 +45,21 @@ _SYMBOL_CACHE = OrderedDict()
 # ---------------------------------------------------------------------------
 # Persistent symbol index (B5) — saves/loads AST cache to disk
 # ---------------------------------------------------------------------------
-_PERSIST_DIR = os.path.expanduser("~/.hermes/plugins/code_intel/.cache")
+def _persist_dir() -> str:
+    """Persist cache dir under the ACTIVE Hermes home (profile-aware).
+
+    原本硬編碼 ``~/.hermes/...``：在 HERMES_HOME 指向 %LOCALAPPDATA%\\hermes 的安裝上
+    會寫錯地方（或永遠不命中），等於每次 session 都由零開始 parse。
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        base = str(get_hermes_home())
+    except Exception:  # standalone / CI import — 唔關 Hermes 事就退回舊路徑
+        base = os.path.expanduser("~/.hermes")
+    return os.path.join(base, "plugins", "code_intel", ".cache")
+
+
+_PERSIST_DIR = _persist_dir()
 _PERSIST_VERSION = 2  # bump to invalidate stale caches
 
 def _find_project_root(filepath: str = "") -> str:
@@ -188,12 +202,19 @@ _EXT_TO_LANG = {
     ".rs": "rust",
     ".go": "go",
     ".java": "java",
+    ".php": "php",
     ".c": "c",
     ".cpp": "cpp",
     ".cc": "cpp",
     ".cxx": "cpp",
     ".h": "c",
     ".hpp": "cpp",
+}
+
+# 目錄掃描時永久跳過（vendor/node_modules 之類唔會含你的程式碼，但會拖慢 walk）
+_IGNORE_DIRS = {
+    ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
+    "node_modules", "vendor", "runtime", "dist", "build", ".venv", "venv", ".next", "coverage",
 }
 
 # Supported languages for ast-grep (subset — only those with grammars)
@@ -206,6 +227,39 @@ _AST_GRASP_LANGS = {
 # ---------------------------------------------------------------------------
 
 _SYMBOL_QUERIES = {
+    "php": """
+        ; Functions
+        (function_definition
+            name: (name) @name
+        ) @def
+
+        ; Classes / Interfaces / Traits / Enums
+        (class_declaration
+            name: (name) @name
+        ) @def
+
+        (interface_declaration
+            name: (name) @name
+        ) @def
+
+        (trait_declaration
+            name: (name) @name
+        ) @def
+
+        (enum_declaration
+            name: (name) @name
+        ) @def
+
+        ; Methods (inside class-like bodies)
+        (method_declaration
+            name: (name) @name
+        ) @def
+
+        ; Namespaces
+        (namespace_definition
+            name: (namespace_name) @name
+        ) @def
+    """,
     "python": """
         ; Functions (sync and async) — catches top-level AND bare methods
         ; (method detection happens in extract_symbols via parent chain)
@@ -571,6 +625,11 @@ _NODE_KIND_MAP = {
     "var_declaration": "variable",
     "var_spec": "variable",
     "field_declaration": "field",
+    # PHP (tree-sitter-php)
+    "trait_declaration": "trait",
+    "property_declaration": "variable",
+    "const_declaration": "constant",
+    "namespace_definition": "module",
 }
 
 
@@ -588,6 +647,7 @@ def _init_languages():
             import tree_sitter_rust as tsrust
             import tree_sitter_go as tsgo
             import tree_sitter_java as tsjava
+            import tree_sitter_php as tsphp
             from tree_sitter import Language
         except ImportError as e:
             logger.warning("Code intelligence deps not installed: %s", e)
@@ -601,6 +661,7 @@ def _init_languages():
             "rust": Language(tsrust.language()),
             "go": Language(tsgo.language()),
             "java": Language(tsjava.language()),
+            "php": Language(tsphp.language_php()),
         }
 
         _LANG_CACHE.update(langs)
@@ -1020,10 +1081,7 @@ def code_symbols_tool(
     # Directory: scan all supported files
     results = []
     all_symbols = []
-    for ext in _EXT_TO_LANG:
-        for file_path in sorted(target.rglob(f"*{ext}")):
-            if not file_path.is_file():
-                continue
+    for file_path in _iter_source_files(target):
             file_lang = detect_language(str(file_path), language)
             if file_lang is None:
                 continue
@@ -1178,6 +1236,7 @@ _CODE_SEARCH_PRESETS = {
         "rust": "(call_expression function: (identifier) @func) @call",
         "go": "(call_expression function: (identifier) @func) @call",
         "java": "(method_invocation name: (identifier) @func) @call",
+        "php": "(function_call_expression function: (name) @func) @call\n(member_call_expression name: (name) @func) @call\n(scoped_call_expression name: (name) @func) @call",
     },
     "string_literals": {
         "python": '(string) @str',
@@ -1186,6 +1245,7 @@ _CODE_SEARCH_PRESETS = {
         "rust": '(string_literal) @str',
         "go": '(interpreted_string_literal) @str',
         "java": '(string_literal) @str',
+        "php": '(string) @str\n(encapsed_string) @str',
     },
     "imports": {
         "python": "(import_statement) @import\n(import_from_statement) @import",
@@ -1194,17 +1254,20 @@ _CODE_SEARCH_PRESETS = {
         "rust": "(use_declaration) @import",
         "go": "(import_declaration) @import",
         "java": "(import_declaration) @import",
+        "php": "(namespace_use_declaration) @import\n(require_expression) @import\n(include_expression) @import",
     },
     "decorator_calls": {
         "python": "(decorator) @deco",
         "typescript": "(decorator) @deco",
         "javascript": "(decorator) @deco",
+        "php": "(attribute_list) @deco",
     },
     "try_catch": {
         "python": "(try_statement) @tc",
         "typescript": "(try_statement) @tc",
         "javascript": "(try_statement) @tc",
         "java": "(try_statement) @tc",
+        "php": "(try_statement) @tc",
     },
     "return_stmts": {
         "python": "(return_statement) @ret",
@@ -1213,12 +1276,14 @@ _CODE_SEARCH_PRESETS = {
         "rust": "(return_expression) @ret",
         "go": "(return_statement) @ret",
         "java": "(return_statement) @ret",
+        "php": "(return_statement) @ret",
     },
     "assignments": {
         "python": "(assignment left: (_) @lhs right: (_) @rhs) @assign",
         "typescript": "(assignment_expression left: (_) @lhs right: (_) @rhs) @assign",
         "javascript": "(assignment_expression left: (_) @lhs right: (_) @rhs) @assign",
         "go": "(short_var_declaration left: (_) @lhs right: (_) @rhs) @assign",
+        "php": "(assignment_expression left: (_) @lhs right: (_) @rhs) @assign",
     },
 }
 
@@ -1365,6 +1430,19 @@ def _code_search_single_file(
     })
 
 
+def _iter_source_files(target: Path):
+    """一次 os.walk 走完 target，跳過 ignore 目錄，只 yield 支援的副檔名。
+
+    舊寫法對 18 個副檔名各做一次 `rglob(f"*{ext}")` → 18 次全樹 walk（含 vendor/node_modules），
+    實測 SL886 要 15–107 秒。單次 walk + prune 後只需 ~1 秒。
+    """
+    for root, dirs, files in os.walk(target):
+        dirs[:] = [d for d in dirs if d not in _IGNORE_DIRS]
+        for name in files:
+            if Path(name).suffix.lower() in _EXT_TO_LANG:
+                yield Path(root) / name
+
+
 def _code_search_directory(
     target: Path,
     query: Optional[str] = None,
@@ -1379,10 +1457,7 @@ def _code_search_directory(
     files_with_matches = 0
     remaining = max_results
 
-    for ext in _EXT_TO_LANG:
-        for file_path in sorted(target.rglob(f"*{ext}")):
-            if not file_path.is_file():
-                continue
+    for file_path in _iter_source_files(target):
             file_lang = detect_language(str(file_path), language)
             if file_lang is None:
                 continue
