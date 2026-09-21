@@ -2330,17 +2330,22 @@ def _ast_fallback_references(
             capture_output=True, text=True, timeout=15,
         )
         refs = []
-        for match_line in result.stdout.strip().split("\n"):
+        import re as _re
+        for match_line in result.stdout.splitlines():
             if not match_line:
                 continue
-            # Parse rg output: filepath:linenum:content
-            parts = match_line.split(":", 2)
-            if len(parts) >= 3:
-                refs.append({
-                    "file": parts[0],
-                    "line": int(parts[1]),
-                    "text": parts[2].strip()[:200],
-                })
+            # Parse rg output: filepath:linenum:content.  A Windows path carries its
+            # own colon (``C:\...``), so a plain ``split(":", 2)`` yields 'C' as the
+            # file and crashes on int() of the path.  Anchor on the first
+            # colon-followed-by-digits instead (non-greedy file group).
+            parsed = _re.match(r"^(.+?):(\d+):(.*)$", match_line)
+            if not parsed:
+                continue
+            refs.append({
+                "file": parsed.group(1),
+                "line": int(parsed.group(2)),
+                "text": parsed.group(3).strip()[:200],
+            })
 
         by_file: Dict[str, List[dict]] = {}
         for r in refs:
