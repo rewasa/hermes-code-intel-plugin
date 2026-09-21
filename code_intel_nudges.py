@@ -249,7 +249,7 @@ def build_nudge(
                 short_path = _truncate_path_for_nudge(path)
                 return (
                     f"\n\n💡 {short_path} read {count}x this session — "
-                    "code_capsule(path, line) gives a one-shot summary instead of re-reading."
+                    "use code_capsule(path, line) for a compact summary; if detail is still needed, read only that range."
                 )
             return None
 
@@ -261,8 +261,8 @@ def build_nudge(
             return None
         if _take_nudge_slot(session_key, "read_file"):
             return (
-                f"\n\n💡 {total_lines}-line file read whole — code_symbols(path) lists "
-                "functions/classes with line numbers for far fewer tokens."
+                f"\n\n💡 {total_lines}-line file read whole — prefer code_symbols(path): "
+                "functions/classes with line numbers. If it is insufficient, read only needed ranges."
             )
         return None
 
@@ -279,8 +279,8 @@ def build_nudge(
             return None
         if _take_nudge_slot(session_key, "search_files"):
             return (
-                "\n\n💡 Identifier-like pattern — code_workspace_symbols/code_references "
-                "finds real symbols, not text matches."
+                "\n\n💡 Identifier-like pattern — prefer code_workspace_symbols/code_references "
+                "for semantic navigation. If unavailable or results are insufficient, use bounded text search."
             )
         return None
 
@@ -316,8 +316,8 @@ def build_nudge(
             return None
         if _take_nudge_slot(session_key, "terminal"):
             return (
-                "\n\n💡 grep/find on source code — code_search/code_workspace_symbols "
-                "is AST-aware and won't match comments/strings."
+                "\n\n💡 Source-code search — prefer code_search/code_workspace_symbols "
+                "for semantic results. If unavailable or insufficient, keep shell search bounded to target paths/files."
             )
         return None
 

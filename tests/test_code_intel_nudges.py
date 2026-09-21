@@ -8,8 +8,8 @@ stays covered against regression.
 from code_intel import code_intel_nudges as n
 
 
-def _build(tool_name, args, session="test-sess", result="out"):
-    return n.build_nudge(tool_name, args, result, session, "task-x")
+def _build(tool_name, args, session="test-sess", result=None):
+    return n.build_nudge(tool_name, args, "out" if result is None else result, session, "task-x")
 
 
 def make_src_dir(tmp_path, nfiles=5):
@@ -129,3 +129,30 @@ def test_search_files_identifier_pattern(tmp_path):
     d = make_src_dir(tmp_path)
     got = _build("search_files", {"pattern": "fooBar", "path": str(d), "target": None})
     assert got is not None
+
+
+def test_nudges_prefer_semantic_tools_without_blocking_fallbacks(tmp_path):
+    d = make_src_dir(tmp_path)
+    source = d / "mod00.ts"
+    whole_read = _build(
+        "read_file", {"path": str(source)}, result={"total_lines": n._MIN_LINES_FOR_SYMBOLS_NUDGE}
+    )
+    text_search = _build("search_files", {"pattern": "fooBar", "path": str(d)})
+    shell_search = _build("terminal", {"command": "grep -rn foo %s" % d}, session="semantic-fallback-test")
+
+    assert "If it is insufficient, read only needed ranges." in whole_read
+    assert "If unavailable or results are insufficient, use bounded text search." in text_search
+    assert "If unavailable or insufficient, keep shell search bounded" in shell_search
+
+
+def test_nonsemantic_reads_and_shell_commands_stay_unnudged(tmp_path):
+    source = make_src_dir(tmp_path) / "mod00.ts"
+    assert _build("read_file", {"path": str(source), "offset": 1, "limit": 5}, result={"total_lines": 100}) is None
+    assert _build("terminal", {"command": "git status --short"}) is None
+    assert _build("terminal", {"command": "python -m pytest tests"}) is None
+    assert _build("terminal", {"command": "cat %s" % source}) is None
+    assert _build("terminal", {"command": "grep -rn foo %s" % (tmp_path / "missing")}) is None
+    assert _build("read_file", {"path": str(tmp_path / "missing.ts")}, result={"total_lines": 100}) is None
+    command = {"command": "grep -rn foo %s" % source}
+    assert all(_build("terminal", command, session="bounded") is not None for _ in range(n._MAX_NUDGE_PER_TOOL))
+    assert _build("terminal", command, session="bounded") is None

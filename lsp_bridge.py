@@ -1671,6 +1671,58 @@ def _location_to_dict(loc: dict) -> dict:
     }
 
 
+def _candidate_positions(
+    file_path: str, line: int, character: Optional[int], lang: Optional[str] = None
+) -> List[int]:
+    """1-based columns to try for *line*, honouring an explicit ``character``.
+
+    An explicit column is authoritative (single candidate). Otherwise the first
+    few non-keyword identifiers on the line are tried in order, so a Python
+    ``def foo():`` line or a ``self.x`` attribute line still resolves through
+    LSP instead of dropping into the text/AST fallback. *lang* picks the keyword
+    table used for candidate detection.
+
+    Empty list means the line has NO identifiable symbol (comment, blank line,
+    string literal) — callers must fail closed, never invent a column.
+    """
+    if character:
+        return [character]
+    return _candidate_identifier_columns(file_path, line - 1, lang=lang)
+
+
+def _lsp_locations_for(
+    bridge: Any, target: Path, line: int, character: Optional[int], method: str,
+    include_declaration: bool = True, lang: Optional[str] = None,
+) -> Optional[tuple]:
+    """Try candidate columns against *bridge*.
+
+    Returns ``(locations, character_used, candidates_considered)``, or ``None``
+    when every candidate missed (caller falls back). ``candidates_considered``
+    has more than one entry only when no explicit column was given AND the line
+    carried several identifiers: the first candidate that resolves wins, which
+    means the tool may have silently picked a *different* symbol than a human
+    reading the line would. Callers surface that as ``retry_used`` so the agent
+    can pass an explicit ``character`` when it matters.
+
+    Bounded: at most ``_MAX_LSP_COLUMN_ATTEMPTS`` extra LSP round-trips, all
+    against an already initialized bridge, so worst case is a few ms of JSON-RPC.
+    """
+    candidates = _candidate_positions(str(target), line, character, lang)
+    for cand in candidates[:_MAX_LSP_COLUMN_ATTEMPTS]:
+        try:
+            if method == "definition":
+                locations = bridge.goto_definition(str(target), line - 1, cand - 1)
+            else:
+                locations = bridge.find_references(
+                    str(target), line - 1, cand - 1, include_declaration
+                )
+        except Exception:
+            locations = None
+        if locations:
+            return locations, cand, candidates[:_MAX_LSP_COLUMN_ATTEMPTS]
+    return None
+
+
 def code_definition_tool(
     path: str,
     line: int,
@@ -1698,14 +1750,6 @@ def code_definition_tool(
         return _json.dumps({"error": f"Path not found: {path}"})
 
     lang = language or _detect_language_for_lsp(str(target))
-    lsp_line = line - 1  # Convert to 0-based
-
-    # Auto-detect character position if not provided
-    if character is None:
-        character = _auto_detect_identifier_column(str(target), lsp_line)
-    lsp_char = (character or 0) - 1  # Convert to 0-based
-
-    logger.info("code_definition_tool: %s:%d:%s lang=%s", path, line, character, lang)
 
     # Try LSP first
     manager = get_lsp_manager()
@@ -1717,21 +1761,31 @@ def code_definition_tool(
             logger.warning("code_definition: LSP bridge failed to initialize (server=%s)", bridge.command)
         else:
             logger.debug("code_definition: using LSP bridge: %s (rootUri=%s)", bridge.command, bridge.root_uri)
-            locations = bridge.goto_definition(str(target), lsp_line, lsp_char)
-            if locations:
+            hit = _lsp_locations_for(bridge, target, line, character, "definition", lang=lang)
+            if hit:
+                locations, used_char, considered = hit
                 logger.info("code_definition: LSP returned %d locations", len(locations))
                 defs = [_location_to_dict(loc) for loc in locations]
-                return _json.dumps({
+                result = {
                     "path": str(target),
-                    "query": {"line": line, "character": character},
+                    "query": {"line": line, "character": used_char},
                     "method": "lsp",
                     "lsp_server": bridge.command,
                     "definition_count": len(defs),
                     "definitions": defs,
                     "formatted": _format_definitions(defs),
-                }, indent=2)
-            else:
-                logger.info("code_definition: LSP returned 0 locations, falling back to AST")
+                }
+                if not character and len(considered) > 1:
+                    result["retry_used"] = True
+                    result["candidates_considered"] = considered
+                    result["ambiguity_note"] = (
+                        f"No explicit `character` given and line {line} carries "
+                        f"{len(considered)} identifiers (columns {considered}); column "
+                        f"{used_char} is the first one LSP resolved. If that is not the "
+                        f"symbol you meant, pass `character=<column>` explicitly."
+                    )
+                return _json.dumps(result, indent=2)
+            logger.info("code_definition: LSP returned 0 locations, falling back to AST")
 
     # Fallback: AST-based definition search
     logger.debug("code_definition: using AST fallback")
@@ -1770,15 +1824,9 @@ def code_references_tool(
         return _json.dumps({"error": f"Path not found: {path}"})
 
     lang = language or _detect_language_for_lsp(str(target))
-    lsp_line = line - 1  # Convert to 0-based
 
-    # Auto-detect character position if not provided
-    if character is None:
-        character = _auto_detect_identifier_column(str(target), lsp_line)
-    lsp_char = (character or 0) - 1  # Convert to 0-based
-
-    logger.info("code_references_tool: %s:%d:%d lang=%s includeDecl=%s",
-        path, line, character, lang, include_declaration)
+    logger.info("code_references_tool: %s:%d:%s lang=%s includeDecl=%s",
+        path, line, character if character is not None else "auto", lang, include_declaration)
 
     # Try LSP first
     manager = get_lsp_manager()
@@ -1790,9 +1838,12 @@ def code_references_tool(
             logger.warning("code_references: LSP bridge failed to initialize (server=%s)", bridge.command)
         else:
             logger.debug("code_references: using LSP bridge: %s (rootUri=%s)", bridge.command, bridge.root_uri)
-            locations = bridge.find_references(
-                str(target), lsp_line, lsp_char, include_declaration
+            hit = _lsp_locations_for(
+                bridge, target, line, character, "references", include_declaration,
+                lang=lang,
             )
+            locations, used_char = (hit[0], hit[1]) if hit else (None, None)
+            considered = hit[2] if hit else []
             if locations:
                 logger.info("code_references: LSP returned %d locations", len(locations))
                 refs = [_location_to_dict(loc) for loc in locations]
@@ -1801,10 +1852,11 @@ def code_references_tool(
                 for r in refs:
                     by_file.setdefault(r["file"], []).append(r)
 
+                ambiguous = not character and len(considered) > 1
                 if not group_by_file:
-                    return _json.dumps({
+                    payload = {
                         "path": str(target),
-                        "query": {"line": line, "character": character},
+                        "query": {"line": line, "character": used_char},
                         "method": "lsp",
                         "lsp_server": bridge.command,
                         "reference_count": len(refs),
@@ -1812,25 +1864,44 @@ def code_references_tool(
                         "references": refs,
                         "by_file": by_file,
                         "formatted": _format_references(refs, by_file),
-                    }, indent=2)
+                    }
+                    if ambiguous:
+                        payload["retry_used"] = True
+                        payload["candidates_considered"] = considered
+                        payload["ambiguity_note"] = (
+                            f"No explicit `character` given and line {line} carries "
+                            f"{len(considered)} identifiers (columns {considered}); "
+                            f"column {used_char} is the first one LSP resolved. If that "
+                            f"is not the symbol you meant, pass `character=<column>`."
+                        )
+                    return _json.dumps(payload, indent=2)
                 # Compact group-by-file mode (token-saving)
                 compact_by_file = {
                     f: [{"line": r["line"], "column": r.get("column"), "text": r.get("text", "")[:80]}
                          for r in file_refs]
                     for f, file_refs in sorted(by_file.items())
                 }
-                return _json.dumps({
+                payload = {
                     "path": str(target),
-                    "query": {"line": line, "character": character},
+                    "query": {"line": line, "character": used_char},
                     "method": "lsp",
                     "lsp_server": bridge.command,
                     "reference_count": len(refs),
                     "files_affected": len(by_file),
                     "by_file": compact_by_file,
                     "formatted": _format_references(refs, by_file),
-                }, indent=2)
-            else:
-                logger.info("code_references: LSP returned 0 locations, falling back to AST")
+                }
+                if ambiguous:
+                    payload["retry_used"] = True
+                    payload["candidates_considered"] = considered
+                    payload["ambiguity_note"] = (
+                        f"No explicit `character` given and line {line} carries "
+                        f"{len(considered)} identifiers (columns {considered}); "
+                        f"column {used_char} is the first one LSP resolved. If that "
+                        f"is not the symbol you meant, pass `character=<column>`."
+                    )
+                return _json.dumps(payload, indent=2)
+            logger.info("code_references: LSP returned 0 locations, falling back to AST")
 
     # Fallback: AST-based references search
     logger.debug("code_references: using AST fallback")
@@ -2013,6 +2084,21 @@ def code_callers_tool(
             by_file_callers.setdefault(c["file"], []).append(c)
         result["by_file"] = by_file_callers
 
+    # Never present call sites derived from a capped reference list as complete:
+    # a rename/refactor decided on partial callers silently misses call sites.
+    if refs_data.get("truncated"):
+        result["truncated"] = True
+        result["callers_may_be_incomplete"] = True
+        result["hint"] = (
+            "Call sites were derived from a TRUNCATED text-fallback reference list "
+            f"({refs_data.get('reference_count')} of "
+            f"{refs_data.get('total_matches', 'more')} matches), so some callers are "
+            "missing. Narrow the query or use a live LSP server before relying on "
+            "this for a rename."
+        )
+    if refs_data.get("ambiguity_note"):
+        result["ambiguity_note"] = refs_data["ambiguity_note"]
+
     return _json.dumps(result, indent=2)
 
 
@@ -2039,54 +2125,185 @@ def code_callees_tool(
 # ---------------------------------------------------------------------------
 
 
-def _auto_detect_identifier_column(file_path: str, line: int) -> Optional[int]:
-    """Find the column of the first meaningful identifier on *line* (0-based).
+_MAX_LSP_COLUMN_ATTEMPTS = 4
 
-    Skips common language keywords (import, export, from, const, etc.) to land
-    on actual symbol names like ``createLogger`` or ``PropertyService``.
+# Bound the text-based reference fallback so a common identifier in a large
+# repo can't dump thousands of hits into the transcript. The result carries
+# ``truncated: true`` so the caller knows to narrow the query.
+_MAX_TEXT_FALLBACK_REFS = 60
+
+# Words that are syntax in EVERY supported language (or so close that treating
+# them as a symbol name is never right). Used when the language is unknown.
+_KEYWORDS_GLOBAL = frozenset({
+    "import", "export", "from", "const", "let", "var", "class", "function",
+    "return", "async", "await", "type", "interface", "if", "else", "for",
+    "while", "new", "throw", "try", "catch", "finally", "switch", "case",
+    "break", "continue", "default", "extends", "implements", "super",
+    "this", "static", "public", "private", "protected", "readonly",
+    "declare", "enum", "namespace", "module", "require", "as",
+    "void", "null", "undefined", "true", "false", "of", "in",
+    "def", "lambda", "elif", "except", "raise", "yield",
+    "global", "nonlocal", "assert", "del", "pass", "with", "not", "and",
+    "or", "is", "None", "True", "False",
+    "fn", "pub", "impl", "struct", "trait", "mut", "func", "package",
+    "defer", "chan", "goto", "extern", "unsafe",
+})
+
+# Language-specific keyword tables. Filtering with a single global set silently
+# skipped perfectly legal symbol names — a Python project with `def print(...)`,
+# a variable named `use`, or a Rust `fn use_thing()` had its candidate column
+# pushed to the NEXT identifier on the line, i.e. the wrong symbol resolved
+# (worse than a miss). Only keywords ACTUALLY reserved in the file's language
+# are skipped.
+_KEYWORDS_BY_LANGUAGE = {
+    "python": frozenset({
+        "def", "lambda", "class", "return", "if", "elif", "else", "for",
+        "while", "try", "except", "finally", "raise", "yield", "global",
+        "nonlocal", "assert", "del", "pass", "with", "not", "and", "or",
+        "is", "in", "import", "from", "as", "async", "await", "None",
+        "True", "False", "break", "continue", "nonlocal", "match",
+    }),
+    "typescript": frozenset({
+        "import", "export", "from", "const", "let", "var", "class",
+        "function", "return", "async", "await", "type", "interface",
+        "if", "else", "for", "while", "new", "throw", "try", "catch",
+        "finally", "switch", "case", "break", "continue", "default",
+        "extends", "implements", "static", "public", "private",
+        "protected", "readonly", "declare", "enum", "namespace", "module",
+        "require", "as", "void", "null", "undefined", "true", "false",
+        "of", "in", "this", "delete", "typeof", "instanceof", "keyof",
+        "satisfies", "abstract", "override", "yield",
+    }),
+    "javascript": frozenset({
+        "import", "export", "from", "const", "let", "var", "class",
+        "function", "return", "async", "await", "if", "else", "for",
+        "while", "new", "throw", "try", "catch", "finally", "switch",
+        "case", "break", "continue", "default", "extends", "static",
+        "void", "null", "undefined", "true", "false", "of", "in", "this",
+        "delete", "typeof", "instanceof", "yield", "with",
+    }),
+    "rust": frozenset({
+        "fn", "pub", "impl", "struct", "trait", "use", "mut", "let",
+        "match", "enum", "mod", "crate", "where", "dyn", "ref", "move",
+        "async", "await", "unsafe", "extern", "as", "loop", "while",
+        "for", "in", "if", "else", "return", "break", "continue",
+        "const", "static", "type", "self", "super",
+    }),
+    "go": frozenset({
+        "func", "package", "import", "var", "const", "type", "struct",
+        "interface", "map", "chan", "defer", "go", "select", "range",
+        "goto", "fallthrough", "if", "else", "for", "return", "break",
+        "continue", "switch", "case", "default",
+    }),
+    "java": frozenset({
+        "class", "interface", "enum", "extends", "implements", "public",
+        "private", "protected", "static", "final", "void", "new", "this",
+        "super", "package", "import", "return", "if", "else", "for",
+        "while", "switch", "case", "break", "continue", "try", "catch",
+        "finally", "throw", "throws", "abstract", "synchronized",
+        "instanceof", "null", "true", "false", "const", "goto", "assert",
+    }),
+}
+
+# Words skipped only when used as an attribute RECEIVER (`self.value`): the
+# symbol the caller means is `value`, but a symbol literally named `self` stays
+# reachable on lines where it is not followed by a dot.
+_ATTRIBUTE_RECEIVERS = frozenset({"self", "cls", "this"})
+
+
+def _keywords_for(lang: Optional[str]) -> frozenset:
+    """Keyword table for *lang* (``None``/unknown -> conservative global set)."""
+    if not lang:
+        return _KEYWORDS_GLOBAL
+    key = lang.lower()
+    if key in ("tsx", "typescriptreact"):
+        key = "typescript"
+    elif key in ("jsx", "javascriptreact"):
+        key = "javascript"
+    elif key == "ts":
+        key = "typescript"
+    elif key == "js":
+        key = "javascript"
+    return _KEYWORDS_BY_LANGUAGE.get(key, _KEYWORDS_GLOBAL)
+
+
+def _iter_line_identifiers(text: str, lang: Optional[str] = None) -> List[tuple]:
+    """Return ``(word, start_col_1based)`` for candidate identifiers in *text*.
+
+    Skips string literals and the keywords of the file's own language so callers
+    land on the actual symbol rather than syntax (``def``, ``class``, ``return``).
+    Builtins are NOT filtered: ``def print(msg)`` is legal Python, and dropping
+    ``print`` would move the detected column to ``msg`` — the wrong symbol.
     """
-    _KEYWORDS = frozenset({
-        "import", "export", "from", "const", "let", "var", "class", "function",
-        "return", "async", "await", "type", "interface", "if", "else", "for",
-        "while", "new", "throw", "try", "catch", "finally", "switch", "case",
-        "break", "continue", "default", "extends", "implements", "super",
-        "this", "static", "public", "private", "protected", "readonly",
-        "declare", "enum", "namespace", "module", "require", "as",
-        "void", "null", "undefined", "true", "false", "of", "in",
-    })
+    keywords = _keywords_for(lang)
+    out: List[tuple] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ('"', "'", "`"):
+            quote = ch
+            i += 1
+            while i < n and text[i] != quote:
+                if text[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1  # skip closing quote
+            continue
+        if ch.isalpha() or ch == "_":
+            start = i
+            while i < n and (text[i].isalnum() or text[i] == "_"):
+                i += 1
+            word = text[start:i]
+            j = i
+            while j < n and text[j] == " ":
+                j += 1
+            attribute_receiver = (
+                word in _ATTRIBUTE_RECEIVERS and j < n and text[j] == "."
+                and text[j:j + 2] != ".."
+            )
+            if word in keywords or attribute_receiver:
+                continue
+            out.append((word, start + 1))
+            continue
+        i += 1
+    return out
 
+
+def _candidate_identifier_columns(
+    file_path: str, line: int, limit: int = 4, lang: Optional[str] = None
+) -> List[int]:
+    """Plausible identifier columns (1-based) on *line*, best guess first.
+
+    The first entry is the historical behaviour. The remaining entries exist
+    because the first identifier on a line is often NOT the symbol the caller
+    meant (a Python ``def``/``lambda`` line, ``self.x``, a decorator, a
+    type annotation). Returning them lets the LSP call retry a bounded number
+    of times instead of collapsing straight into the expensive text fallback.
+
+    *lang* selects the keyword table; unknown languages use the conservative
+    global set.
+    """
     try:
         lines = Path(file_path).read_text("utf-8", errors="replace").split("\n")
         if line < 0 or line >= len(lines):
-            return None
-        text = lines[line]
-        # Extract word-like tokens and skip keywords
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            if ch.isalpha() or ch == '_':
-                # Found start of a word
-                start = i
-                while i < len(text) and (text[i].isalnum() or text[i] == '_'):
-                    i += 1
-                word = text[start:i]
-                if word not in _KEYWORDS:
-                    return start + 1  # 1-based
-                # else: skip this keyword, continue scanning
-            elif ch in ('"', "'", '`'):
-                # Skip string literals
-                quote = ch
-                i += 1
-                while i < len(text) and text[i] != quote:
-                    if text[i] == '\\':
-                        i += 1
-                    i += 1
-                i += 1  # skip closing quote
-            else:
-                i += 1
+            return []
+        return [col for _word, col in _iter_line_identifiers(lines[line], lang)][:limit]
     except OSError:
-        pass
-    return None
+        return []
+
+
+def _auto_detect_identifier_column(
+    file_path: str, line: int, lang: Optional[str] = None
+) -> Optional[int]:
+    """Find the column of the first meaningful identifier on *line* (0-based).
+
+    Skips language keywords (import, export, from, const, def, etc.) to land
+    on actual symbol names like ``createLogger`` or ``PropertyService``.
+    Returns ``None`` when the line has no identifier at all (a comment, a blank
+    line, a closing brace); callers must handle ``None`` explicitly.
+    """
+    candidates = _candidate_identifier_columns(file_path, line, limit=1, lang=lang)
+    return candidates[0] if candidates else None
 
 
 def _ast_fallback_definition(
@@ -2151,6 +2368,13 @@ def _ast_fallback_definition(
 
     # Extract identifier
     identifier = ""
+    if not character:
+        # No explicit column: reuse line-level candidate detection so a
+        # `def foo():` / `self.value` line resolves to `foo` / `value` instead
+        # of failing closed with "Could not extract an identifier".
+        cands = _candidate_identifier_columns(file_path, line - 1, limit=1, lang=lang)
+        if cands:
+            character = cands[0]
     if character and text_line and character <= len(text_line):
         idx = character - 1
         start = idx
@@ -2258,6 +2482,11 @@ def _ast_fallback_references(
         text_line = ""
 
     identifier = ""
+    if not character:
+        # Same line-level candidate detection as the definition fallback.
+        cands = _candidate_identifier_columns(file_path, line - 1, limit=1, lang=lang)
+        if cands:
+            character = cands[0]
     if character and text_line and character <= len(text_line):
         idx = character - 1
         start = idx
@@ -2285,10 +2514,10 @@ def _ast_fallback_references(
             ["rg", "--no-heading", "--line-number", "-n", "-w", identifier, root],
             capture_output=True, text=True, timeout=15,
         )
+        raw_lines = [ln for ln in result.stdout.split("\n") if ln.strip()]
+        total_matches = len(raw_lines)
         refs = []
-        for match_line in result.stdout.strip().split("\n"):
-            if not match_line:
-                continue
+        for match_line in raw_lines:
             # Parse rg output: filepath:linenum:content
             parts = match_line.split(":", 2)
             if len(parts) >= 3:
@@ -2297,21 +2526,43 @@ def _ast_fallback_references(
                     "line": int(parts[1]),
                     "text": parts[2].strip()[:200],
                 })
+                if len(refs) >= _MAX_TEXT_FALLBACK_REFS:
+                    break
+
+        truncated = total_matches > len(refs)
 
         by_file: Dict[str, List[dict]] = {}
         for r in refs:
             by_file.setdefault(r["file"], []).append(r)
 
-        return _json.dumps({
+        files_total = len({ln.split(":", 1)[0] for ln in raw_lines}) if raw_lines else 0
+
+        payload = {
             "path": file_path,
             "query": {"line": line, "character": character, "identifier": identifier},
             "method": "fallback_text",
             "warning": "LSP returned no results (or is unavailable), using text-based search. May include false positives.",
             "reference_count": len(refs),
             "files_affected": len(by_file),
+            "truncated": truncated,
             "references": refs,
             "by_file": by_file,
-        }, indent=2)
+            "formatted": _format_references(
+                refs, by_file, truncated=truncated, total_matches=total_matches,
+            ),
+        }
+        if truncated:
+            # Never let a capped list look authoritative for a rename/refactor.
+            payload["total_matches"] = total_matches
+            payload["files_total"] = files_total
+            payload["more"] = max(0, total_matches - len(refs))
+            payload["hint"] = (
+                f"Only the first {len(refs)} of {total_matches} matches are listed "
+                f"across {files_total} file(s) — this list is INCOMPLETE. Narrow the "
+                f"query (explicit `character`, a narrower path) or use "
+                f"code_references with a live LSP server before a rename/refactor."
+            )
+        return _json.dumps(payload, indent=2)
 
     except FileNotFoundError:
         return _json.dumps({
@@ -2518,12 +2769,30 @@ def _format_definitions(defs: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def _format_references(refs: List[dict], by_file: Dict[str, List[dict]]) -> str:
-    """Format references results for display."""
+def _format_references(
+    refs: List[dict], by_file: Dict[str, List[dict]],
+    truncated: bool = False, total_matches: Optional[int] = None,
+) -> str:
+    """Format references results for display.
+
+    When the list was capped, the header says so explicitly. A prose summary
+    that reads like a complete list while silently holding 60 of 4000 matches is
+    how a downstream rename/refactor gets planned on partial data.
+    """
     if not refs:
         return "No references found."
 
-    lines = [f"Found {len(refs)} references across {len(by_file)} file(s):"]
+    if truncated:
+        shown = len(refs)
+        total = total_matches if total_matches is not None else f"{shown}+"
+        lines = [
+            f"TRUNCATED: showing first {shown} of {total} matches across "
+            f"{len(by_file)} file(s) — INCOMPLETE. Refine the query "
+            f"(explicit `character`, narrower path) before trusting this list "
+            f"for a rename/refactor."
+        ]
+    else:
+        lines = [f"Found {len(refs)} references across {len(by_file)} file(s):"]
 
     for file_path, file_refs in sorted(by_file.items()):
         # Shorten path if it's within the workspace
@@ -2906,9 +3175,17 @@ def code_rename_tool(
         return _json.dumps({"error": "Could not auto-detect language"})
 
     lsp_line = line - 1
-    if character is None:
-        character = _auto_detect_identifier_column(str(target), lsp_line)
-    lsp_char = (character or 1) - 1
+    if not character:
+        character = _auto_detect_identifier_column(str(target), lsp_line, lang)
+        if character is None:
+            return _json.dumps({
+                "error": "Could not auto-detect an identifier on this line; "
+                         "no rename position to act on.",
+                "path": str(target),
+                "line": line,
+                "hint": "Pass `character=<column>` (1-based) for the exact symbol.",
+            })
+    lsp_char = character - 1
 
     manager = get_lsp_manager()
     bridge = manager.get_bridge(lang, str(target))
@@ -3068,9 +3345,16 @@ def code_hover_tool(
         return _json.dumps({"error": "Could not auto-detect language"})
 
     lsp_line = line - 1
-    if character is None:
-        character = _auto_detect_identifier_column(str(target), lsp_line)
-    lsp_char = (character or 1) - 1
+    if not character:
+        character = _auto_detect_identifier_column(str(target), lsp_line, lang)
+        if character is None:
+            return _json.dumps({
+                "error": "Could not auto-detect an identifier on this line.",
+                "path": str(target),
+                "line": line,
+                "hint": "Pass `character=<column>` (1-based).",
+            })
+    lsp_char = character - 1
 
     manager = get_lsp_manager()
     bridge = manager.get_bridge(lang, str(target))
@@ -3163,9 +3447,16 @@ def code_type_definition_tool(
         return _json.dumps({"error": "Could not auto-detect language"})
 
     lsp_line = line - 1
-    if character is None:
-        character = _auto_detect_identifier_column(str(target), lsp_line)
-    lsp_char = (character or 1) - 1
+    if not character:
+        character = _auto_detect_identifier_column(str(target), lsp_line, lang)
+        if character is None:
+            return _json.dumps({
+                "error": "Could not auto-detect an identifier on this line.",
+                "path": str(target),
+                "line": line,
+                "hint": "Pass `character=<column>` (1-based).",
+            })
+    lsp_char = character - 1
 
     manager = get_lsp_manager()
     bridge = manager.get_bridge(lang, str(target))
@@ -3275,7 +3566,7 @@ def code_signatures_tool(
         return _json.dumps({"error": "Could not auto-detect language"})
 
     lsp_line = line - 1
-    if character is None:
+    if not character:
         # Try to land cursor inside the first '(' on the line
         try:
             with open(target, "r", encoding="utf-8") as f:
@@ -3284,7 +3575,8 @@ def code_signatures_tool(
             src_line = ""
         idx = src_line.find("(")
         character = (idx + 2) if idx >= 0 else 1
-    lsp_char = (character or 1) - 1
+    # `character` is always an int here (explicit argument or derived above).
+    lsp_char = character - 1
 
     manager = get_lsp_manager()
     bridge = manager.get_bridge(lang, str(target))

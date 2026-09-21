@@ -83,11 +83,13 @@ def _on_session_end(**kwargs: Any) -> None:
     saved = persist_symbol_cache()
     clear_symbol_cache()
 
-    # B1: proactively drop this session's nudge-rate-limit state instead of
-    # relying solely on LRU eviction under sustained load.
-    from .code_intel_nudges import forget_session
-    session_key = kwargs.get("session_id") or kwargs.get("task_id")
-    forget_session(session_key)
+    # Proactively drop bounded per-session steering state.
+    session_id = kwargs.get("session_id")
+    task_id = kwargs.get("task_id")
+    from .code_intel_nudges import forget_session as forget_nudge_session
+    from .code_intel_defaults import forget_session as forget_default_session
+    forget_nudge_session(session_id or task_id)
+    forget_default_session(session_id, task_id)
 
 
 def register(ctx: PluginContext) -> None:
@@ -111,31 +113,87 @@ def register(ctx: PluginContext) -> None:
     )
     ctx.register_hook("on_session_end", _on_session_end)
 
-    # C2: pre_llm_call hook — inject compact code context for coding queries
+    # C1: frozen system-prompt section — the ONLY plugin surface that reaches
+    # every session (main agent AND delegated subagents) unconditionally, once
+    # per session, before any tool selection. Per-turn hooks (pre_llm_call /
+    # transform_tool_result) only reach turns that already went wrong or that
+    # happen to match a heuristic; this is the reliable default.
+    # Bounded to a few hundred chars; older cores without the API are skipped.
+    try:
+        _register_section = getattr(ctx, "register_system_prompt_section", None)
+        if callable(_register_section):
+            _register_section(
+                id="code-intel.defaults",
+                content=(
+                    "Code work default — semantic tools are installed and preferred:\n"
+                    "- what is in a file: `code_symbols(path)` before reading it whole\n"
+                    "- find a symbol: `code_workspace_symbols(query)`\n"
+                    "- where it is defined: `code_definition(path, line)`; "
+                    "`code_capsule(path, line)` for signature+doc+definition in one call\n"
+                    "- who uses it: `code_references(path, line, group_by_file=True)` "
+                    "before any rename/refactor\n"
+                    "- structural search: `code_search(path, preset=...)` (AST-aware, "
+                    "no comment/string false positives)\n"
+                    "- after edits: `code_diagnostics(path)`\n"
+                    "Fallback is allowed and never blocked: when a semantic tool is "
+                    "unavailable, errors, or its output is insufficient, read targeted "
+                    "line ranges or run a text/shell search bounded to specific "
+                    "paths/globs. Do not stall on semantics."
+                ),
+                position="after_memory",
+                max_chars=1200,
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger("code_intel").warning(
+            f"code_intel: system prompt section registration failed ({e}) — "
+            f"relying on per-turn hooks only"
+        )
+
+    # C2: pre_llm_call hook — one compact default + bounded auto-context.
     def _pre_llm_call_inject_context(**kwargs: Any) -> Optional[str]:
-        """
-        Before the LLM processes a prompt, detect if it's a coding query and
-        inject compact context (symbol list, imports, diagnostics) for files
-        mentioned in the conversation. This saves multiple manual navigation steps.
+        """Inject (a) a one-shot coding default and (b) bounded symbol context.
+
+        Two real defects fixed here:
+        * the previous body read only ``kwargs["messages"]``, which the
+          production call site (``agent/turn_context.py``) never passes — it
+          passes ``user_message`` + ``conversation_history``. The hook was a
+          permanent no-op in real sessions while still passing its own tests.
+        * context was rebuilt for every mentioned file on every turn with no
+          session cap, so a long session re-paid the same symbol scan.
+
+        Fail-safe by design: guidance never blocks a fallback tool, and any
+        exception returns ``None`` (no injection) rather than touching the turn.
         """
         try:
-            # Extract recent file paths from conversation context
-            messages = kwargs.get("messages", [])
-            if not messages:
-                return None
-            
-            # Only inject for the last user message
+            from .code_intel_defaults import (
+                build_default_guidance,
+                normalize_messages,
+                take_context_slot,
+            )
+
+            session_id = kwargs.get("session_id")
+            task_id = kwargs.get("task_id")
+            messages = normalize_messages(
+                user_message=kwargs.get("user_message"),
+                messages=kwargs.get("messages"),
+                conversation_history=kwargs.get("conversation_history"),
+            )
+
+            parts = []
+            guidance = build_default_guidance(messages, session_id, task_id)
+            if guidance:
+                parts.append(guidance)
+
             last_msg = ""
             for m in reversed(messages):
-                if isinstance(m, dict) and m.get("role") == "user":
-                    content = m.get("content", "")
-                    if isinstance(content, str):
-                        last_msg = content
+                content = m.get("content")
+                if m.get("role") == "user" and isinstance(content, str):
+                    last_msg = content
                     break
-            
             if not last_msg:
-                return None
-            
+                return "\n".join(parts) if parts else None
+
             # Detect file paths in the message (simple heuristic)
             import re
             file_refs = re.findall(
@@ -143,13 +201,18 @@ def register(ctx: PluginContext) -> None:
                 last_msg
             )
             if not file_refs:
-                return None
-            
+                return "\n".join(parts) if parts else None
+
+            # Consume a context slot only once there IS work to do. Charging the
+            # budget before this point burned all three slots on coding turns that
+            # mentioned no file, leaving the actual symbol scans unbudgeted.
+            if not take_context_slot(session_id, task_id):
+                return "\n".join(parts) if parts else None
+
             # Limit to 3 files to keep context compact
             file_refs = file_refs[:3]
-            
+
             from .code_intel import code_symbols_tool, detect_language
-            context_parts = []
             for fref in file_refs:
                 path = fref
                 if not os.path.isabs(path):
@@ -170,13 +233,11 @@ def register(ctx: PluginContext) -> None:
                                 kind = s.get("kind", "")
                                 line = s.get("line", "")
                                 summary += f"\n  L{line} {kind} {name}"
-                            context_parts.append(summary)
+                            parts.append(summary)
                     except Exception:
                         pass
-            
-            if context_parts:
-                return "\n".join(context_parts)
-            return None
+
+            return "\n".join(parts) if parts else None
         except Exception as e:
             import logging
             logging.getLogger("code_intel").debug(f"pre_llm_call hook error: {e}")
