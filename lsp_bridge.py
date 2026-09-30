@@ -331,7 +331,10 @@ def _hermes_lsp_bin() -> str:
     try:
         from hermes_constants import get_hermes_home
         return str(Path(get_hermes_home()) / "lsp" / "bin")
-    except Exception:  # standalone / CI import
+    except Exception:  # standalone / CI import — Windows 的 Hermes home 係 %LOCALAPPDATA%\hermes
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            return os.path.join(base, "hermes", "lsp", "bin")
         return str(Path.home() / ".hermes" / "lsp" / "bin")
 
 
@@ -417,6 +420,17 @@ def _resolve_command(cmd: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def _lookup_dotted(cfg: Dict[str, Any], section: str) -> Any:
+    """Walk a dotted config section (e.g. 'intelephense.files.exclude') through a nested dict."""
+    node: Any = cfg
+    for part in section.split("."):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return None
+    return node
+
+
 @dataclass
 class LSPBridge:
     """Manages one LSP server process over JSON-RPC stdin/stdout."""
@@ -494,6 +508,28 @@ class LSPBridge:
             }
         return {}
 
+    def _get_workspace_configuration(self) -> Dict[str, Any]:
+        """Server settings sent via workspace/didChangeConfiguration (NOT initializationOptions).
+
+        intelephense only reads storagePath / licenceKey / clearCache from
+        initializationOptions; everything else (files.exclude, stubs, …) must arrive
+        here or via a workspace/configuration pull.  Excluding vendor/runtime keeps
+        first-index cost and memory down on big PHP repos.
+        """
+        if self.language_id == "php":
+            return {
+                "intelephense": {
+                    "files": {
+                        "exclude": [
+                            "**/.git/**", "**/.svn/**", "**/.hg/**", "**/CVS/**",
+                            "**/.DS_Store/**", "**/node_modules/**", "**/bower_components/**",
+                            "**/.history/**", "**/vendor/**", "**/runtime/**",
+                        ]
+                    }
+                }
+            }
+        return {}
+
     def ensure_initialized(self) -> bool:
         """Start the server (if needed) and complete the LSP handshake."""
         with self._init_lock:
@@ -566,6 +602,7 @@ class LSPBridge:
                     "workspace": {
                         "symbol": {"dynamicRegistration": False},
                         "workspaceEdit": {"documentChanges": True},
+                        "configuration": True,
                     },
                 },
             }
@@ -586,6 +623,10 @@ class LSPBridge:
 
             # Send initialized notification
             self._send_notification("initialized", {})
+            # intelephense 等 server 只經 workspace/didChangeConfiguration 收 config。
+            ws_cfg = self._get_workspace_configuration()
+            if ws_cfg:
+                self._send_notification("workspace/didChangeConfiguration", {"settings": ws_cfg})
             self._initialized = True
             self.init_capabilities = init_result.get("capabilities", {}) or {}
             server_info = init_result.get("serverInfo", {})
@@ -818,6 +859,13 @@ class LSPBridge:
             elif method in ("$/progress", "textDocument/didOpen", "textDocument/didChange",
                           "textDocument/didClose", "textDocument/didSave"):
                 pass
+            elif method == "workspace/configuration":
+                # Server pulling config sections (intelephense reads files.exclude this way).
+                items = (msg.get("params") or {}).get("items", [])
+                cfg = self._get_workspace_configuration()
+                result = [_lookup_dotted(cfg, it.get("section", "")) for it in items]
+                self._write_message({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
+                logger.debug("workspace/configuration answered: %d section(s)", len(items))
             else:
                 logger.debug("LSP notification: %s", method)
 

@@ -398,8 +398,14 @@ def register(ctx: PluginContext) -> None:
         # ── FORCE code_intel into every subagent + inject steering ──
         # Renato's rule: code_intel must be DEFAULT for ALL agents, and
         # subagents must KNOW which tools exist and how to use them.
-        if "code_intel" not in dt.DEFAULT_TOOLSETS:
-            dt.DEFAULT_TOOLSETS.append("code_intel")
+        # DEFAULT_TOOLSETS now lives in tools/delegate_tool_toolsets.py (Sep 2026
+        # decomposition); the old tools.delegate_tool path was removed 2026-09-14.
+        try:
+            from tools.delegate_tool_toolsets import DEFAULT_TOOLSETS as _default_toolsets
+        except ImportError:  # pre-decomposition Hermes (compat-layer resolved)
+            _default_toolsets = getattr(dt, "DEFAULT_TOOLSETS")
+        if "code_intel" not in _default_toolsets:
+            _default_toolsets.append("code_intel")
 
         _CODE_INTEL_STEERING = (
             "\n\n## 🧠 Code Intelligence Tools (PREFER over read_file/grep/patch)\n"
