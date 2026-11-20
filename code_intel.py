@@ -1145,6 +1145,16 @@ except ImportError:  # pragma: no cover - exercised in CI/standalone only
     registry = _NoopRegistry()
 
 
+def _register_unless_present(**kwargs):
+    """Register a plugin tool only when Hermes core does not already provide it."""
+    get_entry = getattr(registry, "get_entry", None)
+    if get_entry and get_entry(kwargs["name"]) is not None:
+        logger.info("Skipping plugin tool %s; already registered by Hermes core", kwargs["name"])
+        return False
+    registry.register(**kwargs)
+    return True
+
+
 def _handle_code_symbols(args, **kw):
     return code_symbols_tool(
         path=args.get("path", ""),
@@ -1155,7 +1165,7 @@ def _handle_code_symbols(args, **kw):
     )
 
 
-registry.register(
+_register_unless_present(
     name="code_symbols",
     toolset="code_intel",
     schema=CODE_SYMBOLS_SCHEMA,
@@ -1535,7 +1545,7 @@ def _handle_code_search(args, **kw):
     )
 
 
-registry.register(
+_register_unless_present(
     name="code_search",
     toolset="code_intel",
     schema=CODE_SEARCH_SCHEMA,
@@ -1860,7 +1870,7 @@ def _handle_code_refactor(args, **kw):
     )
 
 
-registry.register(
+_register_unless_present(
     name="code_refactor",
     toolset="code_intel",
     schema=CODE_REFACTOR_SCHEMA,
@@ -2168,6 +2178,24 @@ def code_workspace_summary_tool(path: str = "", depth: int = 2) -> str:
         return apps, packages
 
     apps_list, packages_list = _scan(target, max_d=depth)
+    if (target / "pnpm-workspace.yaml").exists():
+        try:
+            from .lsp_bridge import _find_workspace_folders
+            apps_list, packages_list = [], []
+            for folder in _find_workspace_folders(str(target)):
+                child = Path(folder)
+                pkg_json = child / "package.json"
+                if not pkg_json.exists():
+                    continue
+                data = _json.loads(pkg_json.read_text("utf-8", errors="replace"))
+                item = {
+                    "name": data.get("name", child.name),
+                    "path": str(child),
+                    "language": _detect_lang(child),
+                }
+                (apps_list if data.get("private") else packages_list).append(item)
+        except Exception:
+            pass
 
     top_deps = {}
     if pkg.exists():

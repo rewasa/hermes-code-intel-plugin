@@ -53,15 +53,12 @@ logger.propagate = False  # don't double-log to Hermes root logger
 # Reduced from 30 → 15: LSP servers routinely respond in <1s. If they
 # don't, it's usually a deadlock (e.g. tsserver parsing a giant file
 # that isn't actually relevant to the query).
-_LSP_REQUEST_TIMEOUT = 15
+_LSP_REQUEST_TIMEOUT = 10
 
 # Maximum time (seconds) to wait for the server to start and respond to
-# the ``initialize`` handshake.
-# 30s: CI runners cold-start tsserver/pyright from network caches; 15s made
-# the *first* initialize time out, which then deadlocked in shutdown()
-# (see RLock note at _init_lock) and stalled the whole suite. 30s covers a
-# cold server; locally warm servers init in <1s.
-_LSP_INIT_TIMEOUT = 30
+# the ``initialize`` handshake. Keep init + request + fallback below the
+# 60-second tool budget even when a cold server stalls.
+_LSP_INIT_TIMEOUT = 20
 
 # How long to keep an idle server alive before shutting it down.
 _LSP_IDLE_TIMEOUT = 300  # 5 minutes
@@ -292,8 +289,7 @@ def _find_workspace_folders(root: str) -> List[str]:
                 stripped = line.strip()
                 if stripped.startswith("- "):
                     val = stripped[2:].strip().strip("'\"")
-                    if not val.startswith("!"):  # skip exclusions
-                        patterns.append(val)
+                    patterns.append(val)
             cfg = {"packages": patterns} if patterns else None
         except Exception:
             return []
@@ -301,22 +297,16 @@ def _find_workspace_folders(root: str) -> List[str]:
     if not cfg or "packages" not in cfg:
         return []
 
-    folders: List[str] = []
+    included: set[Path] = set()
+    excluded: set[Path] = set()
     for pattern in cfg["packages"]:
-        if pattern.startswith("!"):
-            continue
-        # Glob-expand the pattern (e.g. "apps/*" → all subdirs of apps/)
-        matches = sorted(root_path.glob(pattern))
-        for m in matches:
-            if m.is_dir():
-                folders.append(str(m))
-        # Also include the parent as a workspace root hint
-        parent_match = root_path / pattern.replace("/*", "")
-        if parent_match.is_dir() and str(parent_match) not in folders:
-            # Only if the pattern is a glob (contains *)
-            if "*" not in pattern and str(parent_match) not in folders:
-                folders.append(str(parent_match))
-    return folders
+        is_exclusion = pattern.startswith("!")
+        matches = {m for m in root_path.glob(pattern.lstrip("!")) if m.is_dir()}
+        if is_exclusion:
+            excluded.update(matches)
+        else:
+            included.update(matches)
+    return [str(path) for path in sorted(included - excluded)]
 
 
 _LSP_EXTRA_BIN_DIRS = (
